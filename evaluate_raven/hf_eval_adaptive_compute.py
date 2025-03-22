@@ -13,7 +13,7 @@ from lm_eval import evaluator
 from lm_eval.models.huggingface import HFLM
 from lm_eval.models.utils import stop_sequences_criteria
 
-from recpre.raven_modeling_minimal import CausalSelfAttention, RavenForCausalLM
+from recpre.raven_modeling_minimal import CausalSelfAttention, RavenForCausalLM, RavenGenerateDecoderOnlyOutput
 from evaluate_raven.quick_checkpoint_eval import prepare_results
 
 
@@ -106,6 +106,7 @@ class HuginnWrapper(HFLM):
         self.lookup_strategy = lookup_strategy
         self.continuous_compute = continuous_compute
         self.latent_dampening = latent_dampening
+        self.avg_compute_steps = []  # Add this to track compute steps
         update_huggingface_implementation(self.model)
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
@@ -116,8 +117,9 @@ class HuginnWrapper(HFLM):
             max_length=max_length,
             use_cache=True,
             pad_token_id=self.tokenizer.pad_token_id,
+            return_dict_in_generate=True,
         )
-        return super()._model_generate(
+        output = super()._model_generate(
             context,
             max_length,
             stop,
@@ -129,6 +131,12 @@ class HuginnWrapper(HFLM):
             latent_dampening=self.latent_dampening,
             **generation_kwargs
         )
+        
+        # Capture avg_compute_steps if available
+        if isinstance(output, RavenGenerateDecoderOnlyOutput):
+            self.avg_compute_steps.append(output.avg_compute_steps) # type: ignore
+            return output.sequences
+        return output
 
 
 def evaluate_single_task(
@@ -181,6 +189,19 @@ def evaluate_single_task(
     
     if results is not None:
         results["config_args"] = config_args
+        
+        # Add avg_compute_steps to results if available
+        if hasattr(model, 'avg_compute_steps') and model.avg_compute_steps:
+            # Flatten the list if it contains nested lists
+            flat_steps = []
+            for steps in model.avg_compute_steps:
+                if isinstance(steps, list):
+                    flat_steps.extend(steps)
+                else:
+                    flat_steps.append(steps)
+            
+            results["avg_compute_steps"] = flat_steps
+        
         prepare_results(results, Path(f"{task_name}_results.json"))
     return results
 

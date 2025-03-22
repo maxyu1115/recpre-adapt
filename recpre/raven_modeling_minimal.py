@@ -5,7 +5,7 @@ import math
 
 from torch import Tensor
 from dataclasses import dataclass
-from typing import Optional, Union, Any
+from typing import List, Optional, Union, Any
 
 from .raven_config_minimal import RavenConfig
 from transformers.cache_utils import Cache, DynamicCache
@@ -311,6 +311,10 @@ class SandwichBlock(torch.nn.Module):
         return x, attn_map
 
 
+@dataclass
+class RavenGenerateDecoderOnlyOutput(GenerateDecoderOnlyOutput):
+    avg_compute_steps: Optional[List[float]] = None
+
 class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
     def __init__(
         self,
@@ -318,6 +322,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
     ) -> None:
         super().__init__(config)
         self.config = config
+        self.save_latents = False
 
         # Transformer layers
         prelude = torch.nn.ModuleList(SandwichBlock(config, layer_id=i) for i in range(config.n_layers_in_prelude))
@@ -470,6 +475,9 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         else:
             num_steps_no_grad, num_steps_with_grad = num_steps, torch.tensor(0) if not x.is_meta else 0
 
+        if hasattr(self, "save_latents") and self.save_latents:
+            latents = [x.clone().detach()]
+
         with torch.no_grad():
             # ultra annoying in ddp due to
             # https://discuss.pytorch.org/t/does-distributeddataparallel-work-with-torch-no-grad-and-find-unused-parameters-false/122594
@@ -480,12 +488,19 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 x, block_idx, attn_maps = self.core_block_forward(
                     xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, return_attn
                 )
+                if hasattr(self, "save_latents") and self.save_latents:
+                    latents.append(x.clone().detach())
 
         for step in range(num_steps_with_grad):
             xk = x
             x, block_idx, attn_maps = self.core_block_forward(
                 xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, return_attn
             )
+            if hasattr(self, "save_latents") and self.save_latents:
+                latents.append(x.clone().detach())
+        if hasattr(self, "save_latents") and self.save_latents:
+            self.latents = latents
+
         return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx, attn_maps
 
     def core_block_forward(
@@ -743,7 +758,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             streamer.end()
 
         if generation_config.return_dict_in_generate:
-            return GenerateDecoderOnlyOutput(
+            return RavenGenerateDecoderOnlyOutput(
                 sequences=input_ids,
                 scores=None,
                 logits=None,
@@ -766,7 +781,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         exit_threshold: Union[str, float, int] = "auto",
         cache_kwargs: dict = {},
         **model_kwargs,
-    ) -> Union[torch.Tensor, GenerateDecoderOnlyOutput]:
+    ) -> Union[torch.Tensor, RavenGenerateDecoderOnlyOutput]:
         """
         Generate tokens with adaptive compute. This is NOT the most efficient implementation.
         For batches, on each token, we iterate until the entire batch finishes.
@@ -780,6 +795,9 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         stop_tokens = self._get_stops(generation_config, tokenizer).to(input_ids.device)
         batch_size = input_ids.shape[0]
         compute_steps = []
+        seq_steps = [0] * batch_size
+        initial_seq_len = input_ids.shape[1]
+        avg_compute_steps = None
 
         # Set up continuous compute if enabled
         if continuous_compute:
@@ -790,7 +808,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
 
         # Generate tokens
-        for step in range(generation_config.max_length - input_ids.shape[1]):
+        for step in range(generation_config.max_length - initial_seq_len):
             # Adaptive compute forward
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             aux_inputs = {
@@ -970,6 +988,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             for i in range(batch_size):
                 if not finished_sequences[i] and stop_tokens is not None and next_token[i, 0] in stop_tokens:
                     finished_sequences[i] = True
+                    seq_steps[i] = step + 1
 
             # Break if all sequences are finished
             if finished_sequences.all():
@@ -978,14 +997,18 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         if streamer:
             streamer.end()
 
+        seq_lens = [seq_steps[i] if seq_steps[i] > 0 else generation_config.max_length - initial_seq_len for i in range(batch_size)]
+        avg_compute_steps = [sum([step[0][i] for step in compute_steps]) / seq_lens[i] for i in range(batch_size)]
+
         if generation_config.return_dict_in_generate:
-            return GenerateDecoderOnlyOutput(
+            return RavenGenerateDecoderOnlyOutput(
                 sequences=input_ids,
                 scores=compute_steps,  # type: ignore
                 logits=None,
                 attentions=None,
                 hidden_states=None,
                 past_key_values=model_kwargs.get("past_key_values"),
+                avg_compute_steps=avg_compute_steps,
             )
         return input_ids
 

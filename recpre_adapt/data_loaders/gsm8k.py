@@ -4,6 +4,7 @@ from datasets import load_dataset
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 import random
 
+from recpre_adapt.data_loaders import PoorMansDataLoaderBase
 
 class GSM8KDataset(Dataset):
     def __init__(self, data, tokenizer, seq_len):
@@ -44,7 +45,7 @@ def collate_fn(batch):
     return input_ids, target_ids
 
 
-class GSM8K:
+class GSM8K(PoorMansDataLoaderBase):
     def __init__(self, device, tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast, 
                  batch_size: int, seq_len: int, val_split: float = 0.1):
         self.batch_size = batch_size

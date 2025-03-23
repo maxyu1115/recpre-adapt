@@ -1,17 +1,19 @@
-from typing import Callable
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
 import os
 import sys
 import logging
+import json
+from typing import Callable, Literal
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Add the parent directory to the Python path to make recpre importable
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from recpre.raven_modeling_minimal import RavenForCausalLM, CausalSelfAttention
+from recpre_adapt.data_loaders import PoorMansDataLoaderBase
 from recpre_adapt.data_loaders.red_pajama import RedPajamaPMD
 from recpre_adapt.data_loaders.gsm8k import GSM8K
+from recpre_adapt.data_loaders.math_pile import MathPilePMD
 from recpre_adapt.raven_exit_model import RavenExitModel
 
 EPSILON = 1e-10
@@ -130,6 +132,8 @@ def compute_loss(
     num_steps: int,
     discount: float,
     target_identity_policy: torch.Tensor,
+    id_sampling_interval: int,
+    is_eval: bool = False,
 ):
     with torch.no_grad():
         model.forward(x, attention_mask=None, num_steps=torch.tensor((num_steps,)))
@@ -147,6 +151,7 @@ def compute_loss(
     # expected_returns[num_steps] = scores[num_steps]
     expected_loss = scores[num_steps]
     expected_steps = torch.ones_like(scores[num_steps]) * num_steps
+    expected_true_loss = scores[num_steps]
 
     # Iterate backwards from numsteps - 1 to 1, since we need the next reward to calculate the current one
     for i in range(num_steps - 1, 0, -1):
@@ -160,28 +165,22 @@ def compute_loss(
         expected_loss = policy[:, :, 0] * (scores[i]) * (2 - discount ** i) + policy[:, :, 1] * expected_loss
         with torch.no_grad():
             expected_steps = policy[:, :, 0] * i + policy[:, :, 1] * expected_steps
-
-        # Calculate policy gradient loss
-        # # We want to maximize expected reward, so we minimize negative expected reward
-        # # policy[:, :, 0] is probability of exiting, policy[:, :, 1] is probability of continuing
-        # action_probs = torch.stack([policy[:, :, 0], policy[:, :, 1]], dim=1)
-
-        # # Calculate loss - negative expected reward
-        # loss = -torch.mean(r * torch.log(action_probs + 1e-10))
+            if is_eval:
+                expected_true_loss = policy[:, :, 0] * scores[i] + policy[:, :, 1] * expected_true_loss
 
     identity_loss = torch.zeros((x.shape[0], x.shape[1]), device=model.device)
-    for i in range(num_steps):
-        identity_policy = exit_model.forward(latents[i], latents[i])
+    for i in range(num_steps // id_sampling_interval):
+        identity_policy = exit_model.forward(latents[i * id_sampling_interval], latents[i * id_sampling_interval])
         identity_loss += -torch.sum(target_identity_policy * torch.log(identity_policy + EPSILON), dim=-1)
 
     # Backpropagate and update model
-    identity_loss = identity_loss / num_steps
-    return expected_loss, identity_loss, expected_steps
+    identity_loss = identity_loss / (num_steps // id_sampling_interval)
+    return expected_loss, identity_loss, expected_steps, expected_true_loss
 
 def train(
     model: RavenForCausalLM,
     exit_model: RavenExitModel,
-    redpajama_pmd: RedPajamaPMD,
+    pmd: PoorMansDataLoaderBase,
     optimizer: torch.optim.Optimizer,
     num_steps: int,
     batch_size: int,
@@ -189,6 +188,7 @@ def train(
     training_epochs: int = 100,
     discount: float = 0.99,
     identity_loss_weight: float = 0.1,
+    id_sampling_interval: int = 1,
     verbose: bool = True,
 ):
     model.eval()
@@ -198,45 +198,66 @@ def train(
 
     x_val = []
     for i in range(10):
-        x, _ = redpajama_pmd.get_batch("train")
+        x, _ = pmd.get_batch("train")
         x_val.append(x)
 
     for epoch in range(training_epochs):
-        x, _ = redpajama_pmd.get_batch("train")
+        x, _ = pmd.get_batch("train")
 
         # Train the exit model using the calculated rewards
         optimizer.zero_grad()
 
-        expected_loss, identity_loss, expected_steps = compute_loss(model, exit_model, x, num_steps, discount, target_identity_policy)
+        expected_loss, identity_loss, expected_steps, _ = compute_loss(model, exit_model, x, num_steps, discount, target_identity_policy, id_sampling_interval)
         avg_loss = torch.mean(expected_loss + identity_loss_weight * identity_loss)
 
         avg_loss.backward()
         optimizer.step()
 
-        # if verbose and (epoch < 30 or epoch % 10 == 0):
-        if verbose and (epoch < 30):
-            logging.info(f"Epoch {epoch}, Loss: {avg_loss.item()}, Expected Steps: {torch.mean(expected_steps).item()} std: {torch.std(expected_steps, dim=-1)} max: {torch.max(expected_steps)}")
+        if epoch < 30 or (verbose and epoch % 10 == 0):
+            logging.info(f"Epoch {epoch}, Loss: {avg_loss.item()}, "\
+                f"Expected Steps: {torch.mean(expected_steps).item()}"\
+                f" std: {torch.std(expected_steps, dim=-1)} "\
+                f"max: {torch.max(expected_steps)}")
 
         if epoch % 10 == 0:
             with torch.no_grad():
                 val_losses = []
                 val_identity_losses = []
                 val_expected_steps = []
+                val_true_losses = []
                 for x in x_val:
-                    expected_loss, identity_loss, expected_steps = compute_loss(model, exit_model, x, num_steps, discount, target_identity_policy)
+                    expected_loss, identity_loss, expected_steps, true_loss = compute_loss(model, exit_model, x, num_steps, discount, target_identity_policy, id_sampling_interval, is_eval=True)
                     val_losses.append(torch.mean(expected_loss + identity_loss_weight * identity_loss))
                     val_identity_losses.append(torch.mean(identity_loss))
                     val_expected_steps.append(expected_steps)
+                    val_true_losses.append(true_loss)
                 val_loss = torch.mean(torch.stack(val_losses))
                 val_identity_loss = torch.mean(torch.stack(val_identity_losses))
                 val_expected_steps = torch.stack(val_expected_steps)
-                logging.info(f"Epoch {epoch}, Validation Loss: {val_loss.item()}, Identity Loss: {val_identity_loss.item()}, Expected Steps: {torch.mean(val_expected_steps).item()} std: {torch.std(val_expected_steps, dim=-1).data} max: {torch.max(val_expected_steps).item()}")
+                val_true_loss = torch.mean(torch.stack(val_true_losses))
+                logging.info(f"Epoch {epoch}, True Loss: {val_true_loss.item()}, "\
+                    f"Validation Loss: {val_loss.item()}, "\
+                    f"Identity Loss: {val_identity_loss.item()}, "\
+                    f"Expected Steps: {torch.mean(val_expected_steps).item()}"\
+                    f" std: {torch.std(val_expected_steps, dim=-1)}"\
+                    f" max: {torch.max(val_expected_steps)}")
         if epoch % 100 == 99:
             # Save the model
             torch.save(exit_model.state_dict(), f"exit_model_{epoch}.pt")
 
 
-def main(num_steps: int = 32, batch_size: int = 2, seq_len: int = 1024):
+def main(
+    dataset: Literal["red_pajama", "gsm8k", "math_pile"],
+    num_steps: int = 32,
+    batch_size: int = 2,
+    seq_len: int = 1024
+):
+    torch_seed = 42
+    discount = 0.99
+    identity_loss_weight = 0.05
+    id_sampling_interval = 1
+    training_epochs = 1000
+    learning_rate = 3e-5
     model: RavenForCausalLM = AutoModelForCausalLM.from_pretrained("tomg-group-umd/huginn-0125", trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained("tomg-group-umd/huginn-0125")
 
@@ -246,21 +267,40 @@ def main(num_steps: int = 32, batch_size: int = 2, seq_len: int = 1024):
     model.to("cuda", dtype=torch.bfloat16) # type: ignore
     model.save_latents = True
 
-    torch.manual_seed(42)
-    # torch.manual_seed(1)
+    torch.manual_seed(torch_seed)
 
-    redpajama_pmd = RedPajamaPMD(model.device, tokenizer, batch_size, seq_len)
-    # gsm8k_pmd = GSM8K(model.device, tokenizer, batch_size, seq_len)
+    if dataset == "red_pajama":
+        pmd = RedPajamaPMD(model.device, tokenizer, batch_size, seq_len)
+    elif dataset == "gsm8k":
+        pmd = GSM8K(model.device, tokenizer, batch_size, seq_len)
+    elif dataset == "math_pile":
+        pmd = MathPilePMD(model.device, tokenizer, batch_size, seq_len)
+    else:
+        raise ValueError(f"Invalid dataset: {dataset}")
     exit_model = RavenExitModel(model.config)
     exit_model.to(dtype=torch.float32, device=model.device)
 
-    optimizer = torch.optim.AdamW(exit_model.parameters(), lr=3e-5)
+    optimizer = torch.optim.AdamW(exit_model.parameters(), lr=learning_rate)
+    
+    with open("training_params.json", "w") as f:
+        json.dump({
+            "dataset": dataset,
+            "num_steps": num_steps,
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "training_epochs": training_epochs,
+            "learning_rate": learning_rate,
+            "discount": discount,
+            "identity_loss_weight": identity_loss_weight,
+            "identity_sampling_interval": id_sampling_interval,
+            "torch_seed": torch_seed,
+        }, f)
 
     # Add a non-zero cost to encourage efficiency
-    train(model, exit_model, redpajama_pmd, optimizer, num_steps=num_steps, 
-          batch_size=batch_size, seq_len=seq_len, training_epochs=1000,
-          discount=0.99, identity_loss_weight=0.05, verbose=True)
+    train(model, exit_model, pmd, optimizer, num_steps=num_steps, 
+          batch_size=batch_size, seq_len=seq_len, training_epochs=training_epochs,
+          discount=discount, identity_loss_weight=identity_loss_weight, id_sampling_interval=id_sampling_interval, verbose=False)
 
 
 if __name__ == "__main__":
-    main(batch_size=2, seq_len=1024)
+    main(dataset="red_pajama", batch_size=2, seq_len=512, num_steps=64)

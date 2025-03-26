@@ -124,17 +124,18 @@ def count_matching_topk(target: torch.Tensor, predicted: torch.Tensor, k: int = 
     return matches * -1
 
 
-
 def compute_loss(
     model: RavenForCausalLM,
     exit_model: RavenExitModel,
     x: torch.Tensor,
     num_steps: int,
+    min_loops: int,
     discount: float,
     target_identity_policy: torch.Tensor,
     id_sampling_interval: int,
     is_eval: bool = False,
 ):
+    assert min_loops >= 1
     with torch.no_grad():
         model.forward(x, attention_mask=None, num_steps=torch.tensor((num_steps,)))
         assert len(model.latents) == num_steps + 1
@@ -153,8 +154,8 @@ def compute_loss(
     expected_steps = torch.ones_like(scores[num_steps]) * num_steps
     expected_true_loss = scores[num_steps]
 
-    # Iterate backwards from numsteps - 1 to 1, since we need the next reward to calculate the current one
-    for i in range(num_steps - 1, 0, -1):
+    # Iterate backwards from numsteps - 1 to min_loops, since we need the next reward to calculate the current one
+    for i in range(num_steps - 1, min_loops - 1, -1):
         # latent dimensions: batch_size, seq_len, n_embd
         # policy dimensions: batch_size, seq_len, 2
         policy = exit_model.forward(latents[i - 1], latents[i])
@@ -169,12 +170,12 @@ def compute_loss(
                 expected_true_loss = policy[:, :, 0] * scores[i] + policy[:, :, 1] * expected_true_loss
 
     identity_loss = torch.zeros((x.shape[0], x.shape[1]), device=model.device)
-    for i in range(num_steps // id_sampling_interval):
+    for i in range(min_loops // id_sampling_interval, num_steps // id_sampling_interval):
         identity_policy = exit_model.forward(latents[i * id_sampling_interval], latents[i * id_sampling_interval])
         identity_loss += -torch.sum(target_identity_policy * torch.log(identity_policy + EPSILON), dim=-1)
 
     # Backpropagate and update model
-    identity_loss = identity_loss / (num_steps // id_sampling_interval)
+    identity_loss = identity_loss / (num_steps // id_sampling_interval - min_loops // id_sampling_interval)
     return expected_loss, identity_loss, expected_steps, expected_true_loss
 
 def train(
@@ -186,6 +187,7 @@ def train(
     batch_size: int,
     seq_len: int,
     training_epochs: int = 100,
+    min_loops: int = 8,
     discount: float = 0.99,
     identity_loss_weight: float = 0.1,
     id_sampling_interval: int = 1,
@@ -201,13 +203,27 @@ def train(
         x, _ = pmd.get_batch("train")
         x_val.append(x)
 
+    with torch.no_grad():
+        scores_per_x = []
+        for x in x_val:
+            model.forward(x, attention_mask=None, num_steps=torch.tensor((num_steps,)))
+            assert len(model.latents) == num_steps + 1
+            latents: list[torch.Tensor] = model.latents
+            scores = calculate_scores(model, latents, score_cross_entropy)
+            scores_per_x.append(scores)
+        for i in range(num_steps):
+            total = 0
+            for x in range(len(x_val)):
+                total += scores_per_x[x][i].mean().item()
+            logging.info(f"Recurrence r={i}, Validation Score would be: {total / len(x_val)}")
+
     for epoch in range(training_epochs):
         x, _ = pmd.get_batch("train")
 
         # Train the exit model using the calculated rewards
         optimizer.zero_grad()
 
-        expected_loss, identity_loss, expected_steps, _ = compute_loss(model, exit_model, x, num_steps, discount, target_identity_policy, id_sampling_interval)
+        expected_loss, identity_loss, expected_steps, _ = compute_loss(model, exit_model, x, num_steps, min_loops, discount, target_identity_policy, id_sampling_interval)
         avg_loss = torch.mean(expected_loss + identity_loss_weight * identity_loss)
 
         avg_loss.backward()
@@ -216,7 +232,7 @@ def train(
         if epoch < 30 or (verbose and epoch % 10 == 0):
             logging.info(f"Epoch {epoch}, Loss: {avg_loss.item()}, "\
                 f"Expected Steps: {torch.mean(expected_steps).item()}"\
-                f" std: {torch.std(expected_steps, dim=-1)} "\
+                f" std: {torch.std(expected_steps, dim=-1).data} "\
                 f"max: {torch.max(expected_steps)}")
 
         if epoch % 10 == 0:
@@ -226,7 +242,7 @@ def train(
                 val_expected_steps = []
                 val_true_losses = []
                 for x in x_val:
-                    expected_loss, identity_loss, expected_steps, true_loss = compute_loss(model, exit_model, x, num_steps, discount, target_identity_policy, id_sampling_interval, is_eval=True)
+                    expected_loss, identity_loss, expected_steps, true_loss = compute_loss(model, exit_model, x, num_steps, min_loops, discount, target_identity_policy, id_sampling_interval, is_eval=True)
                     val_losses.append(torch.mean(expected_loss + identity_loss_weight * identity_loss))
                     val_identity_losses.append(torch.mean(identity_loss))
                     val_expected_steps.append(expected_steps)
@@ -250,14 +266,15 @@ def main(
     dataset: Literal["red_pajama", "gsm8k", "math_pile"],
     num_steps: int = 32,
     batch_size: int = 2,
-    seq_len: int = 1024
+    seq_len: int = 1024,
+    discount: float = 0.99,
+    min_loops: int = 1,
+    identity_loss_weight: float = 0.05,
+    id_sampling_interval: int = 1,
+    training_epochs: int = 1000,
+    learning_rate: float = 3e-5,
 ):
     torch_seed = 42
-    discount = 0.99
-    identity_loss_weight = 0.05
-    id_sampling_interval = 1
-    training_epochs = 1000
-    learning_rate = 3e-5
     model: RavenForCausalLM = AutoModelForCausalLM.from_pretrained("tomg-group-umd/huginn-0125", trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained("tomg-group-umd/huginn-0125")
 
@@ -290,11 +307,13 @@ def main(
             "seq_len": seq_len,
             "training_epochs": training_epochs,
             "learning_rate": learning_rate,
+            "min_loops": min_loops,
             "discount": discount,
             "identity_loss_weight": identity_loss_weight,
             "identity_sampling_interval": id_sampling_interval,
             "torch_seed": torch_seed,
-        }, f)
+            "model_variant": "prev+latent",
+        }, f, indent=4)
 
     # Add a non-zero cost to encourage efficiency
     train(model, exit_model, pmd, optimizer, num_steps=num_steps, 
@@ -303,4 +322,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main(dataset="red_pajama", batch_size=2, seq_len=512, num_steps=64)
+    main(dataset="red_pajama", batch_size=2, seq_len=1024, num_steps=32, training_epochs=3000, discount=0.99, identity_loss_weight=0.03, min_loops=8)

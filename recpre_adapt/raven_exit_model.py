@@ -160,12 +160,11 @@ class RavenAdaptiveModel(RavenForCausalLM):
                 if step > 0:  # do not exit in prefill:
                     # Check exit condition for each sequence in batch
                     exit_policy = self.exit_model(prev_latents, current_latents)
-                    # print(exit_policy)
-                    # exit_actions = torch.distributions.Categorical(exit_policy).sample()
-                    # print(exit_policy, exit_actions)
-
-                    # new_exits = exit_actions[:, -1] == 0
-                    new_exits = exit_policy[:, -1, 0] > 0.5
+                    if generation_config.do_sample:
+                        exit_actions = torch.distributions.Categorical(exit_policy).sample()
+                        new_exits = exit_actions[:, -1] == 0
+                    else:
+                        new_exits = exit_policy[:, -1, 0] > 0.5
                     new_exits = new_exits & ~exit_reached & ~finished_sequences
 
                     if new_exits.any():

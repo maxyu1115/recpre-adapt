@@ -23,6 +23,7 @@ def update_huggingface_implementation(model):
     # for name, module in model.named_modules():
     #     if module.__class__.__name__ == "CausalSelfAttention":
     #         module.forward = types.MethodType(CausalSelfAttention.forward, module)
+    model.generate = types.MethodType(RavenForCausalLM.generate, model)
     model.generate_with_adaptive_compute = types.MethodType(RavenForCausalLM.generate_with_adaptive_compute, model)
 
 
@@ -118,25 +119,16 @@ class HuginnWrapper(HFLM):
             pad_token_id=self.tokenizer.pad_token_id,
             return_dict_in_generate=True,
         )
-
-        kwargs = {
-            "criterion": self.criterion,
-            "exit_threshold": self.exit_threshold,
-            "continuous_compute": self.continuous_compute,
-            "latent_dampening": self.latent_dampening,
-        }
-        # We want to avoid passing not used kwargs to the model's generate, since it dispatches based
-        # on the presence of these kwargs instead of their values.
-        if self.lookup_strategy is not None:
-            kwargs["cache_kwargs"] = {"lookup_strategy": self.lookup_strategy}
-        kwargs = {k: v for k, v in kwargs.items() if v is not None and v != False}
-
         output = super()._model_generate(
             context,
             max_length,
             stop,
             generation_config=generation_config,
-            **kwargs,
+            criterion=self.criterion, 
+            exit_threshold=self.exit_threshold, 
+            cache_kwargs={"lookup_strategy": self.lookup_strategy},
+            continuous_compute=self.continuous_compute,
+            latent_dampening=self.latent_dampening,
             **generation_kwargs
         )
         

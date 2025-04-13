@@ -500,6 +500,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 latents.append(x.clone().detach())
         if hasattr(self, "save_latents") and self.save_latents:
             self.latents = latents
+            self.input_embeds = input_embeds
 
         return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx, attn_maps
 
@@ -940,7 +941,10 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
 
                 # For sequences that didn't exit early, use the final logits
                 if next_token_logits is None:
+                    # If no sequence exited early
                     next_token_logits = outputs.logits[:, -1, :]  # type: ignore
+                    for i in range(batch_size):
+                        compute_steps_per_seq[i] = model_inputs["num_steps"]
                 else:
                     # Only update logits for sequences that didn't exit early
                     non_exit_mask = ~exit_reached & ~finished_sequences

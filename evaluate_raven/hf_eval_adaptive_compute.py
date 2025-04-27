@@ -107,7 +107,8 @@ class HuginnWrapper(HFLM):
         self.continuous_compute = continuous_compute
         self.latent_dampening = latent_dampening
         self.avg_compute_steps = []  # Add this to track compute steps
-        update_huggingface_implementation(self.model)
+        # No longer needed since HF has been updated
+        # update_huggingface_implementation(self.model)
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         # The generation configs is only used by the custom generate function call, 

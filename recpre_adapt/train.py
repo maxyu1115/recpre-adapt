@@ -1,3 +1,4 @@
+from enum import Enum
 import os
 import sys
 import logging
@@ -7,6 +8,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
 import math
+import gc
 
 # Add the parent directory to the Python path to make recpre importable
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,10 +21,9 @@ from recpre_adapt.data_loaders.math_pile import MathPilePMD
 from recpre_adapt.data_loaders.testing import TestingDataLoaderWrapper
 from recpre_adapt.raven_exit_model import *
 from recpre_adapt.muon import Muon
-EPSILON = 1e-10
+from recpre_adapt.score import calculate_scores, get_score_func, calculate_optimal_scores
+from recpre_adapt.score import score_cross_entropy, count_matching_topk
 
-# Set up logging
-logging.basicConfig(filename='training.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def update_huggingface_implementation(model):
     """This function selectively updates function implementations in the huggingface model."""
@@ -42,114 +43,36 @@ def generate_causal_mask(seq_len: int, device=None):
     mask = mask.to(device) if device is not None else mask
     return mask
 
-def calculate_scores(
-    model: RavenForCausalLM,
-    latents: list[torch.Tensor],
-    score_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-) -> list[torch.Tensor]:
-    with torch.no_grad():
-        last_latent = latents[-1]
-        target: torch.Tensor = torch.softmax(model.predict_from_latents(last_latent).logits, dim=-1) # type: ignore
-        # target: torch.Tensor = torch.softmax(model.lm_head(last_latent).float(), dim=-1) # type: ignore
-        scores = []
-        for latent in latents:
-            latent_prob: torch.Tensor = torch.softmax(model.predict_from_latents(latent).logits, dim=-1) # type: ignore
-            # latent_prob: torch.Tensor = torch.softmax(model.lm_head(latent).float(), dim=-1) # type: ignore
-            score = score_func(target, latent_prob)
-            scores.append(score)
-    return scores
 
-
-def score_ce_top_k(target: torch.Tensor, predicted: torch.Tensor) -> torch.Tensor:
-    # shape of target and predicted: batch_size, seq_len, vocab_size
-
-    # Get top k values and indices for both target and predicted logits
-    k = 10  # Can be adjusted as needed
-    target_topk = torch.topk(target, k, dim=-1)
-    predicted_topk = torch.topk(predicted, k, dim=-1)
-
-    # Create masks for top k indices
-    target_mask = torch.zeros_like(target).scatter_(-1, target_topk.indices, 1.0)
-    predicted_mask = torch.zeros_like(predicted).scatter_(-1, predicted_topk.indices, 1.0)
-
-    # Zero out non-top k values
-    target_filtered = target * target_mask
-    log_predicted_filtered = torch.log(predicted + EPSILON) * predicted_mask
-
-    # Calculate cross entropy loss between filtered values
-    cross_entropy = -torch.sum(target_filtered * log_predicted_filtered, dim=-1)
-    return cross_entropy
-
-
-def score_cross_entropy(target: torch.Tensor, predicted: torch.Tensor) -> torch.Tensor:
-    """
-    Calculate cross-entropy between two probability distributions.
-    
-    Args:
-        target: Target probability distribution (batch_size, seq_len, vocab_size)
-        predicted: Predicted probability distribution (batch_size, seq_len, vocab_size)
-        
-    Returns:
-        Cross-entropy loss (batch_size, seq_len)
-    """
-    assert target.shape == predicted.shape
-
-    # Proper cross-entropy between distributions: -sum(target * log(predicted))
-    log_predicted = torch.log(predicted + EPSILON)
-    cross_entropy = -torch.sum(target * log_predicted, dim=-1)
-
-    return cross_entropy
-
-def count_matching_topk(target: torch.Tensor, predicted: torch.Tensor, k: int = 10) -> torch.Tensor:
-    """
-    Count the number of matching tokens in the top-k predictions between target and predicted distributions.
-    
-    Args:
-        target: Target probability distribution (batch_size, seq_len, vocab_size)
-        predicted: Predicted probability distribution (batch_size, seq_len, vocab_size)
-        k: Number of top tokens to consider
-        
-    Returns:
-        Tensor containing the count of matching tokens (batch_size, seq_len)
-    """
-    # Get top k indices for both target and predicted logits
-    target_topk = torch.topk(target, k, dim=-1).indices  # (batch_size, seq_len, k)
-    predicted_topk = torch.topk(predicted, k, dim=-1).indices  # (batch_size, seq_len, k)
-    
-    # Create a one-hot representation of target_topk
-    batch_size, seq_len, _ = target.shape
-    target_mask = torch.zeros_like(target).scatter_(-1, target_topk, 1.0)
-    
-    # Count matches by checking which predicted top-k tokens are in target top-k
-    matches = torch.zeros((batch_size, seq_len), device=target.device)
-    for i in range(k):
-        # For each token in predicted top-k, check if it's in target top-k
-        token_indices = predicted_topk[:, :, i].unsqueeze(-1)  # (batch_size, seq_len, 1)
-        matches += target_mask.gather(-1, token_indices).squeeze(-1)  # (batch_size, seq_len)
-    
-    return matches * -1
+class EvalMetrics(Enum):
+    TRUE_LOSS = "true_loss"
+    CROSS_ENTROPY = "cross_entropy"
+    TOP_1_MATCHES = "top_1_matches"
+    TOP_3_MATCHES = "top_3_matches"
+    TOP_5_MATCHES = "top_5_matches"
 
 
 def compute_loss(
     model: RavenForCausalLM,
-    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel],
+    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel, LatentRecurrentExitModel],
     second_exit_model: Optional[LatentDiffExitModel], # the second exit model is just used to log gradients
+    score_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     x: torch.Tensor,
     num_steps: int,
     min_loops: int,
-    discount: float,
+    penalty: float,
     is_eval: bool = False,
 ):
     assert min_loops >= 1
-
-    penalty = 2 - discount
 
     with torch.no_grad():
         model.forward(x, attention_mask=None, num_steps=torch.tensor((num_steps,)))
         assert len(model.latents) == num_steps + 1
         latent_list: list[torch.Tensor] = model.latents
+        probs: list[torch.Tensor] = [torch.softmax(model.predict_from_latents(latent).logits, dim=-1) for latent in latent_list] # type: ignore
+        # probs: list[torch.Tensor] = [torch.softmax(model.lm_head(latent).float(), dim=-1) for latent in latent_list] # type: ignore
         input_embeds: torch.Tensor = model.input_embeds
-        scores = calculate_scores(model, latent_list, score_cross_entropy)
+        scores = calculate_scores(probs, score_func)
         # last_layer_latents = []
         # for latent in latent_list:
         #     for block_idx, block in enumerate(model.transformer.coda, start=1):
@@ -157,13 +80,27 @@ def compute_loss(
         #     latent = model.transformer.ln_f(latent)
         #     last_layer_latents.append(latent.clone())
         # scores = calculate_scores(model, last_layer_latents, score_cross_entropy)
+        if is_eval:
+            eval_scores = {
+                EvalMetrics.TRUE_LOSS: scores,
+                EvalMetrics.CROSS_ENTROPY: calculate_scores(probs, score_cross_entropy),
+                EvalMetrics.TOP_1_MATCHES: calculate_scores(probs, lambda target, predicted: count_matching_topk(target, predicted, 1)),
+                EvalMetrics.TOP_3_MATCHES: calculate_scores(probs, lambda target, predicted: count_matching_topk(target, predicted, 3)/3.0),
+                EvalMetrics.TOP_5_MATCHES: calculate_scores(probs, lambda target, predicted: count_matching_topk(target, predicted, 5)/5.0),
+            }
+        del probs
+
 
     # loss for the last step. shape: batch_size, seq_len
     # expected_loss = scores[num_steps] * (penalty ** num_steps)
     expected_loss = torch.zeros_like(scores[num_steps])
     next_loss = scores[num_steps] * (penalty ** num_steps)
     expected_steps = torch.ones_like(scores[num_steps]) * num_steps
-    expected_true_loss = scores[num_steps]
+    expected_true_losses = {}
+    if is_eval:
+        expected_true_losses = {metric: eval_scores[metric][num_steps] for metric in EvalMetrics}
+
+    predicted_policy = torch.zeros(x.shape[0], x.shape[1], num_steps, 2, device=x.device, dtype=torch.float32)
 
     if isinstance(exit_model, LTEExitModel) or isinstance(exit_model, LatentTransformerExitModel):
         attn_mask = generate_causal_mask(num_steps, model.device)
@@ -178,10 +115,13 @@ def compute_loss(
         else:
             entire_policy = exit_model.forward(latents, attn_mask=attn_mask)
         # unflatten policy back to (batch_size, seq_len, recurrent_depth, 2)
-        entire_policy = entire_policy.unflatten(dim=0, sizes=(x.shape[0], x.shape[1]))
+        predicted_policy = entire_policy.unflatten(dim=0, sizes=(x.shape[0], x.shape[1]))
+    elif isinstance(exit_model, LatentRecurrentExitModel):
+        predicted_policy = exit_model.forward(torch.stack(latent_list, dim=2))
 
-    # Iterate backwards from numsteps - 1 to min_loops, since we need the next reward to calculate the current one
-    for i in range(num_steps - 1, min_loops - 1, -1):
+    for i in range(min_loops, num_steps):
+        if isinstance(exit_model, LatentTransformerExitModel) or isinstance(exit_model, LTEExitModel) or isinstance(exit_model, LatentRecurrentExitModel):
+            continue
         # latent dimensions: batch_size, seq_len, n_embd
         # policy dimensions: batch_size, seq_len, 2
         if i == num_steps - 1 and second_exit_model is not None:
@@ -193,8 +133,12 @@ def compute_loss(
             # policy = exit_model.forward(last_layer_latents[i - 1], last_layer_latents[i])
         elif isinstance(exit_model, LatentDiffEmbeddingExitModel):
             policy = exit_model.forward(input_embeds, latent_list[i - 1], latent_list[i])
-        else:
-            policy = entire_policy[:, :, i, :]
+
+        predicted_policy[:, :, i, :] = policy.float()
+
+    # Iterate backwards from numsteps - 1 to min_loops, since we need the next reward to calculate the current one
+    for i in range(num_steps - 1, min_loops - 1, -1):
+        policy = predicted_policy[:, :, i, :]
         # 0 means we exit, 1 means we continue
         # NOTE: scores here are (0, inf), and we penalize an additional cost for each extra
         # expected_loss = policy[:, :, 0] * (scores[i]) * (penalty ** i) + policy[:, :, 1] * expected_loss
@@ -205,34 +149,32 @@ def compute_loss(
         with torch.no_grad():
             expected_steps = policy[:, :, 0] * i + policy[:, :, 1] * expected_steps
             if is_eval:
-                expected_true_loss = policy[:, :, 0] * scores[i] + policy[:, :, 1] * expected_true_loss
+                for metric in EvalMetrics:
+                    expected_true_losses[metric] = policy[:, :, 0] * eval_scores[metric][i] + policy[:, :, 1] * expected_true_losses[metric]
 
     expected_loss = expected_loss / (num_steps - min_loops)
 
-    first_exit_loss = None
+    first_exit_losses = {}
     first_exit_steps = None
     if is_eval:
         with torch.no_grad():
-            first_exit_loss = torch.zeros_like(scores[num_steps])
+            first_exit_losses = {metric: torch.zeros_like(eval_scores[metric][num_steps]) for metric in EvalMetrics}
             first_exit_steps = torch.zeros_like(scores[num_steps])
             exit_reached = torch.zeros_like(scores[num_steps]).bool()
             for i in range(min_loops, num_steps):
-                if isinstance(exit_model, LatentDiffExitModel):
-                    policy = exit_model.forward(latent_list[i - 1], latent_list[i])
-                elif isinstance(exit_model, LatentDiffEmbeddingExitModel):
-                    policy = exit_model.forward(input_embeds, latent_list[i - 1], latent_list[i])
-                else:
-                    policy = entire_policy[:, :, i, :]
+                policy = predicted_policy[:, :, i, :]
                 new_exits = policy[:, :, 0] > 0.5
                 new_exits = new_exits & ~exit_reached
-                first_exit_loss += torch.where(new_exits, scores[i], torch.zeros_like(scores[i]))
+                for metric in EvalMetrics:
+                    first_exit_losses[metric] += torch.where(new_exits, eval_scores[metric][i], torch.zeros_like(eval_scores[metric][i]))
                 first_exit_steps += torch.where(new_exits, torch.ones_like(scores[i]) * i, torch.zeros_like(scores[i]))
                 exit_reached = exit_reached | new_exits
             remaining = ~exit_reached
-            first_exit_loss += torch.where(remaining, scores[num_steps], torch.zeros_like(scores[num_steps]))
+            for metric in EvalMetrics:
+                first_exit_losses[metric] += torch.where(remaining, eval_scores[metric][num_steps], torch.zeros_like(eval_scores[metric][num_steps]))
             first_exit_steps += torch.where(remaining, torch.ones_like(scores[num_steps]) * num_steps, torch.zeros_like(scores[num_steps]))
     # Backpropagate and update model
-    return expected_loss, expected_steps, expected_true_loss, first_exit_loss, first_exit_steps
+    return expected_loss, expected_steps, expected_true_losses, first_exit_losses, first_exit_steps
 
 def get_lr_scheduler(optimizer, warmup_epochs, total_epochs, decay_type="cosine"):
     """
@@ -270,10 +212,59 @@ def get_lr_scheduler(optimizer, warmup_epochs, total_epochs, decay_type="cosine"
             
     return LambdaLR(optimizer, lr_lambda)
 
+
+def report_validation_reference_scores(model, x_val, score_func, num_steps, penalty):
+    with torch.no_grad():
+        # scores_per_x = []
+        eval_scores_per_x = []
+        optimal_scores_per_x = []
+        optimal_indices_per_x = []
+        for x in x_val:
+            model.forward(x, attention_mask=None, num_steps=torch.tensor((num_steps,)))
+            assert len(model.latents) == num_steps + 1
+            latents: list[torch.Tensor] = model.latents
+            probs: list[torch.Tensor] = [torch.softmax(model.predict_from_latents(latent).logits, dim=-1) for latent in latents] # type: ignore
+            # last_layer_latents = []
+            # for latent in latents:
+            #     for block_idx, block in enumerate(model.transformer.coda, start=1):
+            #         latent, _ = block(latent, model.freqs_cis[:, :x.shape[1]], -block_idx)
+            #     latent = model.transformer.ln_f(latent)
+            #     last_layer_latents.append(latent.clone())
+            # scores = calculate_scores(model, last_layer_latents, score_cross_entropy)
+            optimal_scores, optimal_indices = calculate_optimal_scores(probs, score_func, penalty)
+            optimal_scores_per_x.append(torch.mean(optimal_scores))
+            optimal_indices_per_x.append(torch.mean(optimal_indices.float()))
+            true_loss = calculate_scores(probs, score_func)
+            eval_scores = {
+                EvalMetrics.TRUE_LOSS: true_loss,
+                EvalMetrics.CROSS_ENTROPY: calculate_scores(probs, score_cross_entropy),
+                EvalMetrics.TOP_1_MATCHES: calculate_scores(probs, lambda target, predicted: count_matching_topk(target, predicted, 1)),
+                EvalMetrics.TOP_3_MATCHES: calculate_scores(probs, lambda target, predicted: count_matching_topk(target, predicted, 3)/3.0),
+                EvalMetrics.TOP_5_MATCHES: calculate_scores(probs, lambda target, predicted: count_matching_topk(target, predicted, 5)/5.0),
+            }
+            eval_scores_per_x.append(eval_scores)
+            del latents, probs
+            del optimal_scores, optimal_indices
+
+        logging.info(f"Validation scores for reference")
+        logging.info(f"Optimal scores: {torch.mean(torch.stack(optimal_scores_per_x))}, Optimal steps: {torch.mean(torch.stack(optimal_indices_per_x))}")
+        for i in range(num_steps + 1):
+            eval_scores = {}
+            for metric in EvalMetrics:
+                total = 0
+                for x in range(len(x_val)):
+                    total += eval_scores_per_x[x][metric][i].mean().item()
+                eval_scores[metric] = total / len(x_val)
+            eval_score_strs = {k.value: f"{v:.5f}" for k, v in eval_scores.items()}
+            eval_score_strs["discounted_loss"] = f"{eval_scores[EvalMetrics.TRUE_LOSS] * (penalty ** i):.5f}"
+            logging.info(f"Recurrence r={i}: {eval_score_strs}")
+
+
 def train(
     model: RavenForCausalLM,
-    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel],
+    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel, LatentRecurrentExitModel],
     second_exit_model: Optional[LatentDiffExitModel], # the second exit model is just used to log & measure gradients
+    score_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     pmd: PoorMansDataLoaderBase,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: LambdaLR,
@@ -282,8 +273,11 @@ def train(
     training_epochs: int = 100,
     min_loops: int = 1,
     discount: float = 0.99,
+    gradient_boost: float = 10**5,
     verbose: bool = True,
 ):
+    penalty = 2 - discount
+
     model.eval()
 
     x_val = []
@@ -291,26 +285,7 @@ def train(
         x, _ = pmd.get_batch("train")
         x_val.append(x)
 
-    with torch.no_grad():
-        scores_per_x = []
-        for x in x_val:
-            model.forward(x, attention_mask=None, num_steps=torch.tensor((num_steps,)))
-            assert len(model.latents) == num_steps + 1
-            latents: list[torch.Tensor] = model.latents
-            scores = calculate_scores(model, latents, score_cross_entropy)
-            # last_layer_latents = []
-            # for latent in latents:
-            #     for block_idx, block in enumerate(model.transformer.coda, start=1):
-            #         latent, _ = block(latent, model.freqs_cis[:, :x.shape[1]], -block_idx)
-            #     latent = model.transformer.ln_f(latent)
-            #     last_layer_latents.append(latent.clone())
-            # scores = calculate_scores(model, last_layer_latents, score_cross_entropy)
-            scores_per_x.append(scores)
-        for i in range(num_steps + 1):
-            total = 0
-            for x in range(len(x_val)):
-                total += scores_per_x[x][i].mean().item()
-            logging.info(f"Recurrence r={i}, Validation Score would be: {total / len(x_val)}")
+    report_validation_reference_scores(model, x_val, score_func, num_steps, penalty)
 
     for epoch in range(training_epochs):
         x, _ = pmd.get_batch("train")
@@ -318,11 +293,11 @@ def train(
         # Train the exit model using the calculated rewards
         optimizer.zero_grad()
 
-        expected_loss, expected_steps, _, _, _ = compute_loss(model, exit_model, second_exit_model, x, num_steps, min_loops, discount)
-        avg_loss = torch.mean(expected_loss) * (10 ** 5)
+        expected_loss, expected_steps, _, _, _ = compute_loss(model, exit_model, second_exit_model, score_func, x, num_steps, min_loops, penalty)
+        avg_loss = torch.mean(expected_loss) * gradient_boost
 
         avg_loss.backward()
-        if second_exit_model is not None and epoch % 10 == 0:
+        if second_exit_model is not None and epoch % 100 == 0:
             for name, param in second_exit_model.named_parameters():
                 logging.info(f"{name}: {param.grad}")
 
@@ -341,31 +316,37 @@ def train(
             with torch.no_grad():
                 val_losses = []
                 val_expected_steps = []
-                val_true_losses = []
-                val_first_exit_losses = []
+                val_true_losses = {metric: [] for metric in EvalMetrics}
+                val_first_exit_losses = {metric: [] for metric in EvalMetrics}
                 val_first_exit_steps = []
                 for x in x_val:
-                    expected_loss, expected_steps, true_loss, first_exit_loss, first_exit_steps = compute_loss(model, exit_model, second_exit_model, x, num_steps, min_loops, discount, is_eval=True)
+                    expected_loss, expected_steps, true_losses, first_exit_losses, first_exit_steps = compute_loss(model, exit_model, second_exit_model, score_func, x, num_steps, min_loops, penalty, is_eval=True)
                     val_losses.append(torch.mean(expected_loss))
                     val_expected_steps.append(expected_steps)
-                    val_true_losses.append(true_loss)
-                    val_first_exit_losses.append(first_exit_loss)
+                    for metric in EvalMetrics:
+                        val_true_losses[metric].append(true_losses[metric])
+                        val_first_exit_losses[metric].append(first_exit_losses[metric])
                     val_first_exit_steps.append(first_exit_steps)
                 val_loss = torch.mean(torch.stack(val_losses))
                 val_expected_steps = torch.stack(val_expected_steps)
-                val_true_loss = torch.mean(torch.stack(val_true_losses))
-                val_first_exit_loss = torch.mean(torch.stack(val_first_exit_losses))
                 val_first_exit_steps = torch.stack(val_first_exit_steps)
-                logging.info(f"Epoch {epoch}, True Loss: {val_true_loss.item()}, "\
-                    f"First Exit Loss: {val_first_exit_loss.item()}, "\
-                    f"Validation Loss: {val_loss.item()}, \n"\
+                val_true_loss = {}
+                val_first_exit_loss = {}
+                for metric in EvalMetrics:
+                    val_true_loss[metric] = torch.mean(torch.stack(val_true_losses[metric]))
+                    val_first_exit_loss[metric] = torch.mean(torch.stack(val_first_exit_losses[metric]))
+                val_true_loss = {k.value: f"{v.item():.5f}" for k, v in val_true_loss.items()}
+                val_first_exit_loss = {k.value: f"{v.item():.5f}" for k, v in val_first_exit_loss.items()}
+                logging.info(f"Epoch {epoch}, True Loss: {val_true_loss}, "\
+                    f"First Exit Loss: {val_first_exit_loss}, "\
+                    f"Validation Loss: {val_loss}, \n"\
                     f"Expected Steps: {torch.mean(val_expected_steps).item()}"\
                     f" std: {torch.std(val_expected_steps, dim=-1)}"\
                     f" max: {torch.max(val_expected_steps)}, min: {torch.min(val_expected_steps)}"\
                     f" First Exit Steps: {torch.mean(val_first_exit_steps).item()}"\
                     f" max: {torch.max(val_first_exit_steps)}, min: {torch.min(val_first_exit_steps)}"\
                     f" LR: {current_lr:.6f}")
-        if epoch % 100 == 99:
+        if epoch == 99 or epoch % 500 == 499:
             # Save the model
             torch.save(exit_model.state_dict(), f"exit_model_{epoch}.pt")
 
@@ -373,6 +354,7 @@ def train(
 def main(
     dataset: Literal["red_pajama", "gsm8k", "math_pile"],
     optimizer_name: Literal["muon", "adamw"],
+    score_func_name: str,
     num_steps: int = 32,
     batch_size: int = 2,
     seq_len: int = 1024,
@@ -380,10 +362,15 @@ def main(
     min_loops: int = 1,
     trial_mode: bool = False,
     training_epochs: int = 1000,
+    gradient_boost: float = 10**5,
     learning_rate: float = 3e-5,
     warmup_epochs: int = 0,
     decay_type: Literal["cosine", "linear", "step", "none"] = "none",
 ):
+    # Set up logging
+    log_file = "training.log" if not trial_mode else "training_trial.log"
+    logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
     torch_seed = 42
     model: RavenForCausalLM = AutoModelForCausalLM.from_pretrained("tomg-group-umd/huginn-0125", trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained("tomg-group-umd/huginn-0125")
@@ -410,14 +397,18 @@ def main(
         pmd = TestingDataLoaderWrapper(pmd)
     # exit_model = RavenExitModel(model.config)
     # exit_model = RavenBasicLatentExitModel(model.config)
-    exit_model = RavenLatentExitModel(model.config)
+    # exit_model = RavenLatentExitModel(model.config)
     # exit_model = RavenLatentEmbeddingExitModel(model.config)
     # exit_model = RavenLatentTransformerExitModel(model.config)
+    exit_model = RavenLatentRecurrentExitModel(model.config)
     exit_model.to(dtype=torch.bfloat16, device=model.device)
 
     # This second model is used to guage the degree the gradient is vanishing
-    # second_exit_model = RavenLatentExitModel(model.config)
-    # second_exit_model.to(dtype=torch.bfloat16, device=model.device)
+    if trial_mode:
+        second_exit_model = RavenLatentExitModel(model.config)
+        second_exit_model.to(dtype=torch.bfloat16, device=model.device)
+    else:
+        second_exit_model = None
 
     if optimizer_name == "adamw":
         # optimizer = torch.optim.AdamW(list(exit_model.parameters()) + list(second_exit_model.parameters()), lr=learning_rate)
@@ -429,12 +420,16 @@ def main(
     else:
         raise ValueError(f"Invalid optimizer: {optimizer_name}")
 
+    score_func = get_score_func(score_func_name)
+
+
     # Create learning rate scheduler
     lr_scheduler = get_lr_scheduler(optimizer, warmup_epochs, training_epochs, decay_type)
 
     params = {
             "dataset": dataset,
             "optimizer": optimizer_name,
+            "score_func": score_func_name,
             "num_steps": num_steps,
             "batch_size": batch_size,
             "seq_len": seq_len,
@@ -442,10 +437,11 @@ def main(
             "learning_rate": learning_rate,
             "min_loops": min_loops,
             "discount": discount,
+            "gradient_boost": gradient_boost,
             "trial_mode": trial_mode,
             "torch_seed": torch_seed,
             "model": exit_model.__class__.__name__,
-            "model_variant": "prev+latent_transformer+10^5gradboost",
+            "model_variant": "clamped_ce",
             "warmup_epochs": warmup_epochs,
             "decay_type": decay_type,
     }
@@ -457,15 +453,17 @@ def main(
     train(
         model,
         exit_model,
-        None,
+        second_exit_model,
+        score_func,
         pmd,
         optimizer,
         lr_scheduler,
-        num_steps=num_steps, 
+        num_steps=num_steps,
         training_epochs=training_epochs,
         val_batchs=1 if trial_mode else 10,
         min_loops=min_loops,
         discount=discount,
+        gradient_boost=gradient_boost,
         verbose=False,
     )
 
@@ -474,13 +472,15 @@ if __name__ == "__main__":
     main(
         dataset="red_pajama",
         optimizer_name="adamw",
+        score_func_name="ce_matching_top135",
         batch_size=4,
-        seq_len=512,
+        seq_len=256,
         num_steps=32,
         training_epochs=10000,
-        discount=0.999,
-        #  warmup_epochs=100,
-        #  decay_type="cosine",
+        discount=0.99,
+        warmup_epochs=100,
+        decay_type="cosine",
         min_loops=4,
+        gradient_boost=10**3,
         trial_mode=False,
     )

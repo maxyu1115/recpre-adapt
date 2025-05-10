@@ -7,8 +7,6 @@ from typing import Callable, Literal
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
-import math
-import gc
 
 # Add the parent directory to the Python path to make recpre importable
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,28 +18,11 @@ from recpre_adapt.data_loaders.gsm8k import GSM8K
 from recpre_adapt.data_loaders.math_pile import MathPilePMD
 from recpre_adapt.data_loaders.testing import TestingDataLoaderWrapper
 from recpre_adapt.raven_exit_model import *
+from recpre_adapt.features import compute_feature_vectors
 from recpre_adapt.muon import Muon
-from recpre_adapt.score import calculate_scores, get_score_func, calculate_optimal_scores
+from recpre_adapt.score import calculate_scores, get_score_func, calculate_optimal_scores, SCORE_FUNCS
 from recpre_adapt.score import score_cross_entropy, count_matching_topk
-
-
-def update_huggingface_implementation(model):
-    """This function selectively updates function implementations in the huggingface model."""
-    import types
-    model.iterate_forward = types.MethodType(RavenForCausalLM.iterate_forward, model)
-    # for name, module in model.named_modules():
-    #     if module.__class__.__name__ == "CausalSelfAttention":
-    #         module.forward = types.MethodType(CausalSelfAttention.forward, module)
-
-
-def generate_causal_mask(seq_len: int, device=None):
-    """
-    Generate a causal attention mask compatible with transformer models.
-    Returns a mask where 1 means don't attend and 0 means attend.
-    """
-    mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
-    mask = mask.to(device) if device is not None else mask
-    return mask
+from recpre_adapt.utils import update_huggingface_implementation, generate_causal_mask, get_lr_scheduler
 
 
 class EvalMetrics(Enum):
@@ -54,7 +35,7 @@ class EvalMetrics(Enum):
 
 def compute_loss(
     model: RavenForCausalLM,
-    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel, LatentRecurrentExitModel],
+    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel, LatentRecurrentExitModel, FeatureRecurrentExitModel],
     second_exit_model: Optional[LatentDiffExitModel], # the second exit model is just used to log gradients
     loss_func: Literal["rl", "optimal_ce"],
     score_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
@@ -70,7 +51,7 @@ def compute_loss(
         model.forward(x, attention_mask=None, num_steps=torch.tensor((num_steps,)))
         assert len(model.latents) == num_steps + 1
         latent_list: list[torch.Tensor] = model.latents
-        probs: list[torch.Tensor] = [torch.softmax(model.predict_from_latents(latent).logits, dim=-1) for latent in latent_list] # type: ignore
+        probs: list[torch.Tensor] = [model.predict_from_latents(latent).logits for latent in latent_list] # type: ignore
         # probs: list[torch.Tensor] = [torch.softmax(model.lm_head(latent).float(), dim=-1) for latent in latent_list] # type: ignore
         input_embeds: torch.Tensor = model.input_embeds
         scores = calculate_scores(probs, score_func)
@@ -117,7 +98,7 @@ def compute_loss(
 
 def compute_policy(
     model: RavenForCausalLM,
-    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel, LatentRecurrentExitModel],
+    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel, LatentRecurrentExitModel, FeatureRecurrentExitModel],
     second_exit_model: Optional[LatentDiffExitModel],
     x: torch.Tensor,
     num_steps: int,
@@ -142,6 +123,11 @@ def compute_policy(
         return predicted_policy
     elif isinstance(exit_model, LatentRecurrentExitModel):
         predicted_policy = exit_model.forward(torch.stack(latent_list, dim=2))
+        return predicted_policy
+    elif isinstance(exit_model, FeatureRecurrentExitModel):
+        latents = torch.stack(latent_list, dim=2)
+        feature_vectors = compute_feature_vectors(latents)
+        predicted_policy = exit_model.forward(input_embeds, feature_vectors)
         return predicted_policy
 
     predicted_policy = torch.zeros(x.shape[0], x.shape[1], num_steps, 2, device=x.device, dtype=torch.float32)
@@ -288,43 +274,6 @@ def compute_optimal_policy_loss(
     return avg_loss
 
 
-def get_lr_scheduler(optimizer, warmup_epochs, total_epochs, decay_type="cosine"):
-    """
-    Create a learning rate scheduler with warmup and decay.
-    
-    Args:
-        optimizer: The optimizer to modify learning rates for
-        warmup_epochs: Number of epochs for linear warmup
-        total_epochs: Total number of training epochs
-        decay_type: Type of decay after warmup ("cosine", "linear", or "step")
-    
-    Returns:
-        A learning rate scheduler
-    """
-    def lr_lambda(epoch):
-        # Linear warmup phase
-        if epoch < warmup_epochs:
-            return epoch / max(1, warmup_epochs)
-        
-        # Decay phase
-        if decay_type == "cosine":
-            # Cosine decay from 1 to 0 over remaining epochs
-            return 0.5 * (1 + math.cos(math.pi * (epoch - warmup_epochs) / (total_epochs - warmup_epochs)))
-        elif decay_type == "linear":
-            # Linear decay from 1 to 0.1 over remaining epochs
-            decay_ratio = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-            return 1.0 - 0.9 * min(1, decay_ratio)
-        elif decay_type == "step":
-            # Step decay by 0.1 every 1/3 of remaining epochs
-            decay_step = (total_epochs - warmup_epochs) / 3
-            return 0.1 ** (int((epoch - warmup_epochs) / decay_step))
-        else:
-            # No decay
-            return 1.0
-            
-    return LambdaLR(optimizer, lr_lambda)
-
-
 def report_validation_reference_scores(model, x_val, score_func, num_steps, penalty):
     with torch.no_grad():
         # scores_per_x = []
@@ -335,7 +284,7 @@ def report_validation_reference_scores(model, x_val, score_func, num_steps, pena
             model.forward(x, attention_mask=None, num_steps=torch.tensor((num_steps,)))
             assert len(model.latents) == num_steps + 1
             latents: list[torch.Tensor] = model.latents
-            probs: list[torch.Tensor] = [torch.softmax(model.predict_from_latents(latent).logits, dim=-1) for latent in latents] # type: ignore
+            probs: list[torch.Tensor] = [model.predict_from_latents(latent).logits for latent in latents] # type: ignore
             # last_layer_latents = []
             # for latent in latents:
             #     for block_idx, block in enumerate(model.transformer.coda, start=1):
@@ -374,7 +323,7 @@ def report_validation_reference_scores(model, x_val, score_func, num_steps, pena
 
 def train(
     model: RavenForCausalLM,
-    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel, LatentRecurrentExitModel],
+    exit_model: Union[LatentTransformerExitModel, LTEExitModel, LatentDiffExitModel, LatentDiffEmbeddingExitModel, LatentRecurrentExitModel, FeatureRecurrentExitModel],
     second_exit_model: Optional[LatentDiffExitModel], # the second exit model is just used to log & measure gradients
     loss_func: Literal["rl", "optimal_ce"],
     score_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
@@ -384,6 +333,7 @@ def train(
     num_steps: int,
     val_batchs: int = 10,
     training_epochs: int = 100,
+    train_steps_per_x: int = 1,
     min_loops: int = 1,
     discount: float = 0.99,
     gradient_boost: float = 10**5,
@@ -401,11 +351,11 @@ def train(
     report_validation_reference_scores(model, x_val, score_func, num_steps, penalty)
 
     for epoch in range(training_epochs):
-        x, _ = pmd.get_batch("train")
+        if epoch % train_steps_per_x == 0:
+            x, _ = pmd.get_batch("train")
 
         # Train the exit model using the calculated rewards
         optimizer.zero_grad()
-
         expected_loss, _, _, _, _ = compute_loss(model, exit_model, second_exit_model, loss_func, score_func, x, num_steps, min_loops, penalty)
         avg_loss = torch.mean(expected_loss) * gradient_boost
 
@@ -421,7 +371,7 @@ def train(
         if epoch < 30 or (verbose and epoch % 10 == 0):
             logging.info(f"Epoch {epoch}, Loss: {avg_loss.item()}")
 
-        if epoch % 10 == 0:
+        if epoch % 10 == 9:
             with torch.no_grad():
                 val_losses = []
                 val_expected_steps = []
@@ -464,7 +414,7 @@ def main(
     dataset: Literal["red_pajama", "gsm8k", "math_pile"],
     optimizer_name: Literal["muon", "adamw"],
     loss_func: Literal["rl", "optimal_ce"],
-    score_func_name: str,
+    score_func_name: SCORE_FUNCS,
     num_steps: int = 32,
     batch_size: int = 2,
     seq_len: int = 1024,
@@ -472,6 +422,7 @@ def main(
     min_loops: int = 1,
     trial_mode: bool = False,
     training_epochs: int = 1000,
+    train_steps_per_x: int = 1,
     gradient_boost: float = 10**5,
     learning_rate: float = 3e-5,
     warmup_epochs: int = 0,
@@ -491,9 +442,12 @@ def main(
     model.save_latents = True
 
     torch.manual_seed(torch_seed)
+    
+    autoencoder_path = None
 
     if trial_mode:
         batch_size = 1
+        train_steps_per_x = 1
 
     if dataset == "red_pajama":
         pmd = RedPajamaPMD(model.device, tokenizer, batch_size, seq_len)
@@ -510,7 +464,18 @@ def main(
     # exit_model = RavenLatentExitModel(model.config)
     # exit_model = RavenLatentEmbeddingExitModel(model.config)
     # exit_model = RavenLatentTransformerExitModel(model.config)
-    exit_model = RavenLatentRecurrentExitModel(model.config)
+    # exit_model = RavenLatentRecurrentExitModel(model.config)
+    # exit_model = RavenFeatureRecurrentExitModel(model.config, feature_count=5)
+    autoencoder_path = "checkpoints/ae_1/autoencoder_7000.pt"
+    # autoencoder_path = "checkpoints/sae_1/autoencoder_4999.pt"
+    # autoencoder_path = "checkpoints/sae_3/autoencoder_19999.pt"
+    autoencoder = Autoencoder.load_from_checkpoint(autoencoder_path)
+    autoencoder.eval()
+
+    autoencoder.to(device=model.device)
+    print("done loading autoencoder to device")
+    exit_model = RavenAutoencoderRecurrentExitModel(autoencoder)
+    print("done creating exit model")
     exit_model.to(dtype=torch.bfloat16, device=model.device)
 
     # This second model is used to guage the degree the gradient is vanishing
@@ -541,10 +506,12 @@ def main(
             "optimizer": optimizer_name,
             "loss_func": loss_func,
             "score_func": score_func_name,
+            "autoencoder_path": autoencoder_path,
             "num_steps": num_steps,
             "batch_size": batch_size,
             "seq_len": seq_len,
             "training_epochs": training_epochs,
+            "train_steps_per_x": train_steps_per_x,
             "learning_rate": learning_rate,
             "min_loops": min_loops,
             "discount": discount,
@@ -572,6 +539,7 @@ def main(
         lr_scheduler,
         num_steps=num_steps,
         training_epochs=training_epochs,
+        train_steps_per_x=train_steps_per_x,
         val_batchs=1 if trial_mode else 10,
         min_loops=min_loops,
         discount=discount,
@@ -590,10 +558,11 @@ if __name__ == "__main__":
         seq_len=256,
         num_steps=32,
         training_epochs=10000,
-        discount=0.9999,
+        train_steps_per_x=10,
+        discount=0.99,
         warmup_epochs=100,
         decay_type="cosine",
         min_loops=4,
         gradient_boost=10**5,
-        trial_mode=True,
+        trial_mode=False,
     )

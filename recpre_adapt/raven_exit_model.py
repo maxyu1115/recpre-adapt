@@ -12,6 +12,7 @@ from transformers import GenerationConfig
 
 from recpre.raven_modeling_minimal import HuginnDynamicCache, RavenConfig, RavenForCausalLM, RavenGenerateDecoderOnlyOutput
 
+from recpre_adapt.autoencoder import Autoencoder
 
 class LatentDiffExitModel(nn.Module, abc.ABC):
     @abc.abstractmethod
@@ -28,9 +29,17 @@ class LatentRecurrentExitModel(nn.Module, abc.ABC):
     def iterate_forward(self, latent: torch.Tensor, recurrent_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         pass
 
-    @abc.abstractmethod
+    def initialize_recurrent(self, latent: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(latent)
+        # return latent
+
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        pass
+        recurrent_input = self.initialize_recurrent(latents[:, :, 0, :])
+        exit_probs = torch.zeros(latents.shape[0], latents.shape[1], 1, 2, device=latents.device)
+        for i in range(latents.shape[2] - 1):
+            exit_prob, recurrent_input = self.iterate_forward(latents[:, :, i, :], recurrent_input)
+            exit_probs = torch.cat([exit_probs, exit_prob.unsqueeze(2)], dim=2)
+        return exit_probs
 
 class LatentTransformerExitModel(nn.Module, abc.ABC):
     @abc.abstractmethod
@@ -41,6 +50,16 @@ class LatentTransformerExitModel(nn.Module, abc.ABC):
 class LTEExitModel(nn.Module, abc.ABC):
     @abc.abstractmethod
     def forward(self, input_embeddings: torch.Tensor, latents: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        pass
+
+
+class FeatureRecurrentExitModel(nn.Module, abc.ABC):
+    @abc.abstractmethod
+    def iterate_forward(self, input_embeddings: torch.Tensor, feature_vecs: torch.Tensor, recurrent_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        pass
+
+    @abc.abstractmethod
+    def forward(self, input_embeddings: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         pass
 
 
@@ -177,18 +196,6 @@ class RavenLatentRecurrentExitModel(LatentRecurrentExitModel):
         logits = self.out(new_recurrent)
         return F.softmax(logits.float(), dim=-1), new_recurrent
 
-    def initialize_recurrent(self, latent: torch.Tensor) -> torch.Tensor:
-        return torch.zeros_like(latent)
-        # return latent
-
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        recurrent_input = self.initialize_recurrent(latents[:, :, 0, :])
-        exit_probs = torch.zeros(latents.shape[0], latents.shape[1], 1, 2, device=latents.device)
-        for i in range(latents.shape[2] - 1):
-            exit_prob, recurrent_input = self.iterate_forward(latents[:, :, i, :], recurrent_input)
-            exit_probs = torch.cat([exit_probs, exit_prob.unsqueeze(2)], dim=2)
-        return exit_probs
-
 
 class RavenLatentRecurrentExitModel2(LatentRecurrentExitModel):
     def __init__(self, config: RavenConfig):
@@ -210,15 +217,39 @@ class RavenLatentRecurrentExitModel2(LatentRecurrentExitModel):
         logits = self.out(new_recurrent)
         return F.softmax(logits.float(), dim=-1), new_recurrent
 
-    def initialize_recurrent(self, latent: torch.Tensor) -> torch.Tensor:
-        return torch.zeros_like(latent)
-        # return latent
+
+class RavenAutoencoderRecurrentExitModel(LatentRecurrentExitModel):
+    def __init__(self, autoencoder: Autoencoder):
+        super().__init__()
+        self.autoencoder = autoencoder
+
+        self.recurrent_dim = autoencoder.hidden_dim
+        # self.recurrent_dim = autoencoder.hidden_dim // 3
+        self.mlp = GatedMLP(autoencoder.hidden_dim + self.recurrent_dim, output_dim=self.recurrent_dim)
+        self.norm = nn.LayerNorm(autoencoder.hidden_dim + self.recurrent_dim)
+        self.out = nn.Linear(self.recurrent_dim, 2)
+
+        # Initialize weights
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def iterate_forward(self, encoded_latent: torch.Tensor, recurrent_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = torch.cat([encoded_latent, recurrent_input], dim=-1)
+        new_recurrent = recurrent_input + self.mlp(self.norm(x))
+        logits = self.out(new_recurrent)
+        return F.softmax(logits.float(), dim=-1), new_recurrent
+
+    def initialize_recurrent(self, encoded_latent: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(encoded_latent.shape[0], encoded_latent.shape[1], self.recurrent_dim, device=encoded_latent.device, dtype=encoded_latent.dtype)
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        recurrent_input = self.initialize_recurrent(latents[:, :, 0, :])
+        with torch.no_grad():
+            encoded_latents = self.autoencoder.encode(latents)
+
+        recurrent_input = self.initialize_recurrent(encoded_latents[:, :, 0, :])
         exit_probs = torch.zeros(latents.shape[0], latents.shape[1], 1, 2, device=latents.device)
         for i in range(latents.shape[2] - 1):
-            exit_prob, recurrent_input = self.iterate_forward(latents[:, :, i, :], recurrent_input)
+            exit_prob, recurrent_input = self.iterate_forward(encoded_latents[:, :, i, :], recurrent_input)
             exit_probs = torch.cat([exit_probs, exit_prob.unsqueeze(2)], dim=2)
         return exit_probs
 
@@ -317,10 +348,43 @@ class RavenBasicLatentExitModel(LatentDiffExitModel):
         return F.softmax(x.float(), dim=-1)
 
 
+class RavenFeatureRecurrentExitModel(FeatureRecurrentExitModel):
+    def __init__(self, config: RavenConfig, feature_count: int):
+        super().__init__()
+        self.feature_count = feature_count
+        self.mlp = GatedMLP((config.n_embd + self.feature_count) * 2, output_dim=config.n_embd + self.feature_count)
+        self.norm = nn.LayerNorm((config.n_embd + self.feature_count) * 2)
+        self.out = nn.Linear(config.n_embd + self.feature_count, 2)
+
+        # Initialize weights
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def iterate_forward(self, input_embeddings: torch.Tensor, feature_vecs: torch.Tensor, recurrent_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = torch.cat([input_embeddings, feature_vecs, recurrent_input], dim=-1)
+        new_recurrent = recurrent_input + self.mlp(self.norm(x))
+        logits = self.out(new_recurrent)
+        return F.softmax(logits.float(), dim=-1), new_recurrent
+
+    def forward(self, input_embeddings: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        # input_embeddings: [batch_size, seq_len, emb_dim]
+        # features: [batch_size, seq_len, num_loops, feature_dim]
+        assert len(input_embeddings.shape) == 3
+        assert len(features.shape) == 4
+        input_embeddings = input_embeddings.to(self.out.weight.dtype)
+
+        recurrent_input = torch.zeros(input_embeddings.shape[0], input_embeddings.shape[1], input_embeddings.shape[2] + self.feature_count, device=input_embeddings.device, dtype=self.out.weight.dtype)
+        exit_probs = torch.zeros(input_embeddings.shape[0], input_embeddings.shape[1], 1, 2, device=input_embeddings.device, dtype=self.out.weight.dtype)
+        for i in range(features.shape[2]):
+            exit_prob, recurrent_input = self.iterate_forward(input_embeddings, features[:, :, i, :], recurrent_input)
+            exit_probs = torch.cat([exit_probs, exit_prob.unsqueeze(2)], dim=2)
+        return exit_probs
+
+
 class RavenAdaptiveModel(RavenForCausalLM):
     def __init__(self, base_config: RavenConfig, save_latents: bool = False):
         super().__init__(base_config)
-        self.exit_model: Union[LatentDiffExitModel, LTEExitModel, LatentTransformerExitModel] = RavenExitModel(base_config)
+        self.exit_model: Union[LatentDiffExitModel, LTEExitModel, LatentTransformerExitModel]
         self.save_latents = save_latents
         self.latents = None
 

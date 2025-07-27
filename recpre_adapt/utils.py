@@ -2,16 +2,18 @@ from typing import Literal
 import torch
 import math
 from torch.optim.lr_scheduler import LambdaLR
-from recpre.raven_modeling_minimal import RavenForCausalLM
+from recpre.raven_modeling_minimal import RavenForCausalLM, CausalSelfAttention, SandwichBlock
 
 
 def update_huggingface_implementation(model):
     """This function selectively updates function implementations in the huggingface model."""
     import types
     model.iterate_forward = types.MethodType(RavenForCausalLM.iterate_forward, model)
-    # for name, module in model.named_modules():
-    #     if module.__class__.__name__ == "CausalSelfAttention":
-    #         module.forward = types.MethodType(CausalSelfAttention.forward, module)
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == "CausalSelfAttention":
+            module.forward = types.MethodType(CausalSelfAttention.forward, module)
+        elif module.__class__.__name__ == "SandwichBlock":
+            module.forward = types.MethodType(SandwichBlock.forward, module)
 
 
 def generate_causal_mask(seq_len: int, device=None):

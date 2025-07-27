@@ -13,7 +13,7 @@ from lm_eval import evaluator
 from lm_eval.models.huggingface import HFLM
 from lm_eval.models.utils import stop_sequences_criteria
 
-from recpre.raven_modeling_minimal import CausalSelfAttention, RavenForCausalLM, RavenGenerateDecoderOnlyOutput
+from recpre.raven_modeling_minimal import CausalSelfAttention, RavenForCausalLM, RavenGenerateDecoderOnlyOutput, CausalLMOutputRecurrentLatents
 from evaluate_raven.quick_checkpoint_eval import prepare_results
 
 
@@ -35,7 +35,7 @@ class HuginnWrapper(HFLM):
         pretrained: Union[str, transformers.PreTrainedModel],
         *,
         backend: Literal["default", "causal", "seq2seq"] = "default",
-        criterion: Optional[Literal["entropy-diff", "latent-diff", "minp-kl", "argmax-stability"]] = "entropy-diff",
+        criterion: Optional[Literal["entropy-diff", "latent-diff", "minp-kl", "argmax-stability", "adaptive", "auto"]] = "entropy-diff",
         exit_threshold: Optional[Union[str, float, int]] = "auto",
         lookup_strategy: str = "full",
         continuous_compute: bool = False,
@@ -139,21 +139,54 @@ class HuginnWrapper(HFLM):
             return output.sequences
         return output
 
+    def _model_call(self, inps, attn_mask=None, labels=None):
+        """
+        :param inps: torch.Tensor
+            A torch tensor of shape [batch, (sequence_ctx + sequence_cont)] or of shape
+            [batch, sequence_ctx]. the size of sequence may vary from call to call
+        :param attn_mask: torch.Tensor, optional
+            A torch tensor of shape [batch, (sequence_ctx + sequence_cont)]. Only passed
+            (and must be passed) if self.AUTO_MODEL_CLASS is transformers.AutoModelForSeq2SeqLM
+        :param labels: torch.Tensor, optional
+            A torch tensor of shape [batch, (sequence_ctx + sequence_cont)]. Only passed
+            (and must be passed) if self.AUTO_MODEL_CLASS is transformers.AutoModelForSeq2SeqLM
+        :return
+            A torch tensor of shape [batch, sequence, vocab] with the
+        logits returned from the model's decoder
+        """
+        with torch.no_grad():
+            if attn_mask is not None or labels is not None:
+                assert attn_mask is not None and labels is not None
+                assert self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM
+                output = self.model(
+                    input_ids=inps, attention_mask=attn_mask, labels=labels
+                )
+            else:
+                assert self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
+                output = self.model(inps)
+            if isinstance(output, CausalLMOutputRecurrentLatents) and output.stats is not None and "avg_compute_steps" in output.stats:
+                self.avg_compute_steps.append(output.stats["avg_compute_steps"])
+            return output.logits
 
 def evaluate_single_task(
     task_name="gsm8k",
-    model_name="tomg-group-umd/huginn-0125",
+    model: Union[str, RavenForCausalLM] = "tomg-group-umd/huginn-0125",
     device="cuda",
     batch_size=16,
     num_fewshot=5,
     limit=None,
-    criterion: Optional[Literal["entropy-diff", "latent-diff", "minp-kl", "argmax-stability"]] = "entropy-diff",
+    criterion: Optional[Literal["entropy-diff", "latent-diff", "minp-kl", "argmax-stability", "auto", "adaptive"]] = "entropy-diff",
     exit_threshold: Optional[Union[str, float, int]] = "auto",
     num_steps=32,
     lookup_strategy="full",
     continuous_compute=False,
     latent_dampening=False,
+    output_filepath: Optional[str] = None,
+    system_instruction: Optional[str] = None,
 ):
+    model_name = None
+    if isinstance(model, str):
+        model_name = model
     config_args = {
         "task_name": task_name,
         "model_name": model_name,
@@ -165,11 +198,12 @@ def evaluate_single_task(
         "exit_threshold": exit_threshold,
         "num_steps": num_steps,
         "lookup_strategy": lookup_strategy,
+        "system_instruction": system_instruction,
     }
 
     print(f"Evaluating {model_name} on {task_name} with config: {config_args}")
-    model = HuginnWrapper(
-        pretrained=model_name,
+    model_wrapper = HuginnWrapper(
+        pretrained=model,
         device=device,
         batch_size=batch_size,
         trust_remote_code=True,
@@ -181,10 +215,11 @@ def evaluate_single_task(
         latent_dampening=latent_dampening,
     )
     results = evaluator.simple_evaluate(
-        model=model,
+        model=model_wrapper,
         tasks=[task_name],
         num_fewshot=num_fewshot,
         limit=limit,
+        system_instruction=system_instruction,
         gen_kwargs=f"num_steps={num_steps}",
     )
     
@@ -192,10 +227,10 @@ def evaluate_single_task(
         results["config_args"] = config_args
         
         # Add avg_compute_steps to results if available
-        if hasattr(model, 'avg_compute_steps') and model.avg_compute_steps:
+        if hasattr(model_wrapper, 'avg_compute_steps') and model_wrapper.avg_compute_steps:
             # Flatten the list if it contains nested lists
             flat_steps = []
-            for steps in model.avg_compute_steps:
+            for steps in model_wrapper.avg_compute_steps:
                 if isinstance(steps, list):
                     flat_steps.extend(steps)
                 else:
@@ -203,7 +238,10 @@ def evaluate_single_task(
             
             results["avg_compute_steps"] = flat_steps
         
-        prepare_results(results, Path(f"{task_name}_results.json"))
+        if output_filepath is not None:
+            prepare_results(results, Path(output_filepath))
+        else:
+            prepare_results(results, Path(f"{task_name}_results.json"))
     return results
 
 if __name__ == "__main__":
@@ -226,6 +264,7 @@ if __name__ == "__main__":
                         help="Lookup strategy for caching, also supports values like `compression-s4`")
     parser.add_argument("--continuous-compute", dest="continuous_compute", type=bool, default=False, help="Continuous compute")
     parser.add_argument("--latent-dampening", dest="latent_dampening", type=bool, default=False, help="Latent dampening")
+    parser.add_argument("--system-instruction", dest="system_instruction", type=str, default=None, help="System instruction")
 
     args = parser.parse_args()
 
@@ -242,7 +281,7 @@ if __name__ == "__main__":
 
     results = evaluate_single_task(
         task_name=args.task_name,
-        model_name=args.model_name,
+        model=args.model_name,
         device=args.device,
         batch_size=args.batch_size,
         num_fewshot=args.num_fewshot,
@@ -253,4 +292,5 @@ if __name__ == "__main__":
         lookup_strategy=args.lookup_strategy,
         continuous_compute=args.continuous_compute,
         latent_dampening=args.latent_dampening,
+        system_instruction=args.system_instruction,
     )

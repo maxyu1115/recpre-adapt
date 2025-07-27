@@ -1,6 +1,6 @@
 import abc
 import math
-from typing import Optional, Union, Tuple
+from typing import Callable, Optional, Union, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,9 +10,10 @@ from transformers.cache_utils import Cache
 from transformers import GenerationConfig
 
 
-from recpre.raven_modeling_minimal import HuginnDynamicCache, RavenConfig, RavenForCausalLM, RavenGenerateDecoderOnlyOutput
+from recpre.raven_modeling_minimal import CausalLMOutputRecurrentLatents, HuginnDynamicCache, RavenConfig, RavenForCausalLM, RavenGenerateDecoderOnlyOutput, SandwichBlock, precompute_freqs_cis
 
 from recpre_adapt.autoencoder import Autoencoder
+from recpre_adapt.utils import generate_causal_mask
 
 class LatentDiffExitModel(nn.Module, abc.ABC):
     @abc.abstractmethod
@@ -46,6 +47,11 @@ class LatentTransformerExitModel(nn.Module, abc.ABC):
     def forward(self, latents: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         pass
 
+class TransformerExitModel(nn.Module, abc.ABC):
+    @abc.abstractmethod
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        pass
+
 # RavenLatentTransformerExitModel + input_embeddings
 class LTEExitModel(nn.Module, abc.ABC):
     @abc.abstractmethod
@@ -61,6 +67,25 @@ class FeatureRecurrentExitModel(nn.Module, abc.ABC):
     @abc.abstractmethod
     def forward(self, input_embeddings: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         pass
+
+class ProbsRecurrentExitModel(nn.Module, abc.ABC):
+    @abc.abstractmethod
+    def iterate_forward(self, probs: torch.Tensor, recurrent_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        pass
+
+    @abc.abstractmethod
+    def initialize_recurrent(self, probs: torch.Tensor) -> torch.Tensor:
+        pass
+
+    def forward(self, probs: list[torch.Tensor]) -> torch.Tensor:
+        # probs = [F.softmax(logit, dim=-1) for logit in logits]
+        recurrent_input = self.initialize_recurrent(probs[0])
+        exit_probs = torch.zeros(probs[0].shape[0], probs[0].shape[1], 1, 2, device=probs[0].device)
+        for i in range(len(probs) - 1):
+            # print(f"probs[{i}].shape: {probs[i].shape}, recurrent_input.shape: {recurrent_input.shape}")
+            exit_prob, recurrent_input = self.iterate_forward(probs[i], recurrent_input)
+            exit_probs = torch.cat([exit_probs, exit_prob.unsqueeze(2)], dim=2)
+        return exit_probs
 
 
 class GatedMLP(nn.Module):
@@ -154,6 +179,24 @@ class RavenExitModel(LTEExitModel):
         return F.softmax(x.float(), dim=-1)
 
 
+class TransformerBlock(nn.Module):
+    def __init__(self, n_embd: int, n_heads: int):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(n_embd)
+        self.attn = nn.MultiheadAttention(n_embd, n_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(n_embd)
+        self.mlp = GatedMLP(n_embd)
+
+        # Initialize weights
+        nn.init.xavier_normal_(self.attn.in_proj_weight)
+        nn.init.zeros_(self.attn.in_proj_bias)
+
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+        attn_output, attn_weights = self.attn(x, x, x, is_causal=(attn_mask is not None), attn_mask=attn_mask)
+        x = self.norm1(x + attn_output)
+        x = self.norm2(x + self.mlp(x))
+        return x
+
 class RavenLatentTransformerExitModel(LatentTransformerExitModel):
     def __init__(self, config: RavenConfig):
         super().__init__()
@@ -175,6 +218,67 @@ class RavenLatentTransformerExitModel(LatentTransformerExitModel):
         attn_output, attn_weights = self.attn(x, x, x, is_causal=(attn_mask is not None), attn_mask=attn_mask)
         x = self.norm1(x + attn_output)
         x = self.norm2(x + self.mlp(x))
+        x = self.out(x)
+        return F.softmax(x.float(), dim=-1)
+
+class RavenLatentTransformerExitModel2(LatentTransformerExitModel):
+    def __init__(self, config: RavenConfig):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(config.n_embd)
+        self.attn = nn.MultiheadAttention(config.n_embd, config.n_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(config.n_embd)
+        self.mlp = GatedMLP(config.n_embd)
+        self.out = nn.Linear(config.n_embd, 2)
+        
+        # Add positional embeddings
+        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+
+        # Initialize weights
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        nn.init.xavier_normal_(self.attn.in_proj_weight)
+        nn.init.zeros_(self.attn.in_proj_bias)
+        # Initialize positional embeddings
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
+
+    def forward(self, latents: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+        assert len(latents.shape) == 3
+        batch_size, seq_len, n_embd = latents.shape
+        
+        x = latents.to(self.out.weight.dtype)
+        
+        # Add positional embeddings
+        pos_indices = torch.arange(seq_len, device=x.device, dtype=torch.long)
+        pos_embeddings = self.pos_emb(pos_indices)  # [seq_len, n_embd]
+        x = x + pos_embeddings.unsqueeze(0)  # Broadcast to [batch_size, seq_len, n_embd]
+        
+        attn_output, attn_weights = self.attn(x, x, x, is_causal=(attn_mask is not None), attn_mask=attn_mask)
+        x = self.norm1(x + attn_output)
+        x = self.norm2(x + self.mlp(x))
+        x = self.out(x)
+        return F.softmax(x.float(), dim=-1)
+
+
+class RavenAutoencoderLTExitModel(LatentTransformerExitModel):
+    def __init__(self, autoencoder: Autoencoder):
+        super().__init__()
+        self.autoencoder = autoencoder
+        self.latent_dim = autoencoder.hidden_dim
+        
+        self.transformer_block1 = TransformerBlock(self.latent_dim, self.latent_dim // 128)
+        self.transformer_block2 = TransformerBlock(self.latent_dim, self.latent_dim // 128)
+        self.out = nn.Linear(self.latent_dim, 2)
+
+        # Initialize weights
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, latents: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+        assert len(latents.shape) == 3
+        with torch.no_grad():
+            encoded_latents = self.autoencoder.encode(latents)
+        x = self.transformer_block1(encoded_latents, attn_mask)
+        x = self.transformer_block2(x, attn_mask)
         x = self.out(x)
         return F.softmax(x.float(), dim=-1)
 
@@ -381,265 +485,125 @@ class RavenFeatureRecurrentExitModel(FeatureRecurrentExitModel):
         return exit_probs
 
 
-class RavenAdaptiveModel(RavenForCausalLM):
-    def __init__(self, base_config: RavenConfig, save_latents: bool = False):
-        super().__init__(base_config)
-        self.exit_model: Union[LatentDiffExitModel, LTEExitModel, LatentTransformerExitModel]
-        self.save_latents = save_latents
-        self.latents = None
+# class RavenProbsRecurrentExitModel(ProbsRecurrentExitModel):
+#     def __init__(self, config: RavenConfig):
+#         super().__init__()
+#         self.recurrent_dim = config.n_embd
+#         self.ln = nn.Linear(config.vocab_size + self.recurrent_dim, self.recurrent_dim)
+#         self.mlp = GatedMLP(self.recurrent_dim)
+#         self.norm = nn.LayerNorm(self.recurrent_dim)
+#         self.out = nn.Linear(self.recurrent_dim, 2)
 
-    @staticmethod
-    def from_models(model: RavenForCausalLM, exit_model: Union[LatentDiffExitModel, LTEExitModel, LatentTransformerExitModel]):
-        config = model.config
-        new_model = RavenAdaptiveModel(config)
-        new_model.transformer = model.transformer
-        new_model.emb_scale = model.emb_scale
-        new_model.lm_head = model.lm_head
+#         # Initialize weights
+#         nn.init.xavier_uniform_(self.ln.weight)
+#         nn.init.zeros_(self.ln.bias)
+#         nn.init.xavier_uniform_(self.out.weight)
+#         nn.init.zeros_(self.out.bias)
 
-        new_model.exit_model = exit_model
-        return new_model
+#     def initialize_recurrent(self, probs: torch.Tensor) -> torch.Tensor:
+#         return torch.zeros(probs.shape[0], probs.shape[1], self.recurrent_dim, device=probs.device, dtype=probs.dtype)
 
-    @torch._dynamo.disable(recursive=False)  # type: ignore
-    def iterate_forward(
-        self,
-        input_embeds,
-        input_states,
-        freqs_cis,
-        block_idx,
-        mask,
-        past_key_values: Optional[Cache] = None,
-        num_steps: Optional[torch.Tensor] = None,
-        attn_maps: dict = {},
-        return_attn: bool = False,
-    ):
-        x = xk = self.initialize_state(input_embeds) if input_states is None else input_states.clone()
-        if num_steps is None:
-            raise NotImplementedError("Doesn't support num_steps is None")
-        elif hasattr(num_steps, "__len__") and len(num_steps) > 1:
-            num_steps_no_grad, num_steps_with_grad = num_steps
-        else:
-            num_steps_no_grad, num_steps_with_grad = num_steps, torch.tensor(0) if not x.is_meta else 0
-
-        if self.save_latents:
-            latents = [x.clone().detach()]
-
-        for step in range(num_steps_no_grad + num_steps_with_grad):
-            xk = x
-            x, block_idx, attn_maps = self.core_block_forward(
-                xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, return_attn
-            )
-            if self.save_latents:
-                latents.append(x.clone().detach())
-            # self.exit_model(x, xk)
-
-        if self.save_latents:
-            self.latents = latents
-
-        return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx, attn_maps
+#     def iterate_forward(self, probs: torch.Tensor, recurrent_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+#         x = self.ln(torch.cat([probs, recurrent_input], dim=-1))
+#         new_recurrent = self.norm(x + self.mlp(x))
+#         logits = self.out(new_recurrent)
+#         return F.softmax(logits.float(), dim=-1), new_recurrent
 
 
-    @torch.no_grad()
-    def generate_minimal(
-        self,
-        input_ids: torch.LongTensor,
-        max_length: int,
-        num_steps: int,
-    ) -> Union[torch.Tensor, RavenGenerateDecoderOnlyOutput]:
-        """Minimal single-sequence generation. Template for more complicated generate tasks"""
-        gen_length = max_length - input_ids.shape[1]
+def make_block_sum_matrix(m: int, n: int,
+                          dtype: torch.dtype = torch.float32,
+                          device=None) -> torch.Tensor:
+    """
+    Returns a tensor P of shape (n, m) such that, for any x in R^m,
+        y = P @ x
+    is in R^n and
+        y[i] = sum_{j: floor(i*m/n) <= j < floor((i+1)*m/n)} x[j].
+    Blocks may differ in size by at most one if m/n is not integer.
+    """
+    # Allocate zero matrix
+    P = torch.zeros((n, m), dtype=dtype, device=device)
+    # Compute block boundaries
+    for i in range(n):
+        start = int((i    ) * m / n)
+        end   = int((i + 1) * m / n)
+        P[i, start:end] = 1.0
+    return P
 
-        # Generate tokens
-        for _ in range(gen_length):
-            # Forward pass
-            outputs = self.forward(input_ids, num_steps=torch.tensor((num_steps,)))
-            next_token_logits = outputs.logits[:, -1, :] # type: ignore
 
-            # Sample or select next token
-            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+def make_modulo_sum_matrix(m: int,
+                           n: int,
+                           dtype: torch.dtype = torch.float32,
+                           device=None) -> torch.Tensor:
+    """
+    Returns P of shape (n, m) such that for any x in R^m,
+        y = P @ x
+    is in R^n and
+        y[i] = sum_{j: j % n == i} x[j].
+    """
+    # 1) allocate
+    P = torch.zeros((n, m), dtype=dtype, device=device)
+    # 2) compute for each column j which row it belongs to
+    cols = torch.arange(m, device=device)
+    rows = cols % n
+    # 3) set those positions to 1
+    P[rows, cols] = 1.0
+    return P
 
-            input_ids = torch.cat([input_ids, next_token], dim=-1)  # type: ignore
+class RavenProbsRecurrentExitModel(ProbsRecurrentExitModel):
+    def __init__(self, config: RavenConfig):
+        super().__init__()
+        self.recurrent_dim = 4096
+        # self.ln = nn.Linear(config.vocab_size, self.recurrent_dim)
+        self.mlp = GatedMLP(self.recurrent_dim * 2, output_dim=self.recurrent_dim)
+        self.norm = nn.LayerNorm(self.recurrent_dim)
+        self.out = nn.Linear(self.recurrent_dim, 2)
 
-        return input_ids
+        # Initialize weights
+        # nn.init.xavier_uniform_(self.ln.weight)
+        # self.ln.weight = torch.nn.Parameter(make_block_sum_matrix(config.vocab_size, self.recurrent_dim, dtype=self.ln.weight.dtype, device=self.ln.weight.device))
+        # self.ln.weight = torch.nn.Parameter(make_modulo_sum_matrix(config.vocab_size, self.recurrent_dim, dtype=self.ln.weight.dtype, device=self.ln.weight.device))
+        # nn.init.zeros_(self.ln.bias)
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
 
-    @torch.no_grad()
-    def generate_with_adaptive_compute(
-        self,
-        input_ids: torch.LongTensor,
-        generation_config: Optional[GenerationConfig] = None,  # type: ignore
-        tokenizer=None,
-        streamer=None,
-        continuous_compute=False,  # warm-start state / continuous CoT
-        latent_dampening=False,
-        criterion="entropy-diff",
-        exit_threshold: Union[str, float, int] = "auto",
-        cache_kwargs: dict = {},
-        **model_kwargs,
-    ) -> Union[torch.Tensor, RavenGenerateDecoderOnlyOutput]:
-        if criterion != "auto" and criterion != "adaptive":
-            return super().generate_with_adaptive_compute(
-                input_ids, generation_config, tokenizer, streamer, continuous_compute, latent_dampening, criterion, exit_threshold, cache_kwargs, **model_kwargs
-            )
-        
-        if continuous_compute or latent_dampening:
-            raise NotImplementedError("Doesn't support continuous compute or latent dampening")
-        
-        if exit_threshold != "auto":
-            raise NotImplementedError("Doesn't support exit threshold")
-        
-        if generation_config is None:
-            generation_config: GenerationConfig = self.generation_config  # type: ignore
-        model_kwargs["past_key_values"] = HuginnDynamicCache(**cache_kwargs)
-        model_kwargs["use_cache"] = True
-        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
-        stop_tokens = self._get_stops(generation_config, tokenizer).to(input_ids.device)
-        batch_size = input_ids.shape[0]
-        compute_steps = []
-        seq_steps = [0] * batch_size
-        initial_seq_len = input_ids.shape[1]
-        avg_compute_steps = None
+    def initialize_recurrent(self, probs: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(probs.shape[0], probs.shape[1], self.recurrent_dim, device=probs.device, dtype=probs.dtype)
 
-        # Track which sequences have finished
-        finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+    def iterate_forward(self, probs: torch.Tensor, recurrent_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x = self.ln(probs)
+        x = probs
+        x = self.norm(x + self.mlp(torch.cat([recurrent_input, x], dim=-1)))
+        logits = self.out(x)
+        return F.softmax(logits.float(), dim=-1), x
 
-        # Generate tokens
-        for step in range(generation_config.max_length - initial_seq_len):
-            # Adaptive compute forward
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-            aux_inputs = {
-                k: model_inputs[k] for k in ["cache_position", "past_key_values", "attention_mask"] if k in model_inputs
-            }
-            embedded_inputs, block_idx, _ = self.embed_inputs(model_inputs["input_ids"], **aux_inputs)
-            current_latents = self.initialize_state(embedded_inputs, deterministic=not generation_config.do_sample)
 
-            # Initialize criterion tracking for each sequence in batch
-            exit_values_per_seq = [[] for _ in range(batch_size)]
-            compute_steps_per_seq = [0] * batch_size
-            exit_reached = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+class RavenTransformerExitModel(TransformerExitModel):
+    def __init__(self, config: RavenConfig):
+        super().__init__()
+        # self.seq_tf = TransformerBlock(config.n_embd, config.n_heads)
+        self.seq_tf = SandwichBlock(config, 0)
+        self.steps_tf = TransformerBlock(config.n_embd, config.n_heads)
+        self.out = GatedMLP(config.n_embd * 2, output_dim=2)
+        self.register_buffer("freqs_cis", self._precompute_freqs_cis(config), persistent=True)
 
-            all_latents = current_latents.clone().unsqueeze(2)
-            next_token_logits = None
+    def _precompute_freqs_cis(self, config: RavenConfig):
+        # can actually be a buffer now, and remains in fp32! (at least in the settings I tested)
+        freqs_cis = precompute_freqs_cis(
+            config.n_embd // config.num_attention_heads, config.block_size, config.rope_base, 1
+        )
+        return freqs_cis
 
-            # Iterate through compute steps
-            for compute_step in range(model_inputs["num_steps"]):
-                prev_latents = current_latents.clone()
-                current_latents, block_idx, _ = self.iterate_one_step(
-                    embedded_inputs, current_latents, block_idx=block_idx, **aux_inputs
-                )
-                all_latents = torch.cat([all_latents, current_latents.unsqueeze(2)], dim=2)
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        # latents: [batch_size, seq_len, n_steps, n_embd]
+        # latent_seq: [batch_size * n_steps, seq_len, n_embd]
+        x_seq = latents.permute(0, 2, 1, 3).contiguous().reshape(-1, latents.shape[1], latents.shape[3])
+        # seq_mask = generate_causal_mask(latents.shape[1], latents.device)
+        x_seq, _ = self.seq_tf(x_seq, self.freqs_cis[:, : x_seq.shape[1]], 0)
+        x_seq = x_seq.reshape(latents.shape[0], latents.shape[2], latents.shape[1], latents.shape[3]).permute(0, 2, 1, 3).contiguous()
+        # latent_steps: [batch_size * seq_len, n_steps, n_embd]
+        steps_mask = generate_causal_mask(latents.shape[2], latents.device)
+        x_steps = self.steps_tf(latents.reshape(-1, latents.shape[2], latents.shape[3]), steps_mask)
+        x_steps = x_steps.reshape(latents.shape[0], latents.shape[1], latents.shape[2], latents.shape[3])
 
-                if step > 0 and compute_step > 3:  # do not exit in prefill:
-                    # Check exit condition for each sequence in batch
-                    if isinstance(self.exit_model, LatentDiffExitModel):
-                        exit_policy = self.exit_model.forward(all_latents[:, :, -2, :], all_latents[:, :, -1, :])
-                    elif isinstance(self.exit_model, LTEExitModel):
-                        exit_policy = self.exit_model(embedded_inputs[:, -1, :], all_latents.flatten(start_dim=0, end_dim=1))
-                        exit_policy = exit_policy.unflatten(dim=0, sizes=(batch_size, -1))
-                        exit_policy = exit_policy[:, :, -1, :]
-                    elif isinstance(self.exit_model, LatentTransformerExitModel):
-                        exit_policy = self.exit_model.forward(all_latents.flatten(start_dim=0, end_dim=1))
-                        exit_policy = exit_policy.unflatten(dim=0, sizes=(batch_size, -1))
-                        exit_policy = exit_policy[:, :, -1, :]
-                    elif isinstance(self.exit_model, LatentRecurrentExitModel):
-                        exit_policy = self.exit_model.forward(all_latents)
-
-                    if generation_config.do_sample:
-                        exit_actions = torch.distributions.Categorical(exit_policy).sample()
-                        new_exits = exit_actions[:, -1] == 0
-                    else:
-                        new_exits = exit_policy[:, :, 0] > 0.5
-                    new_exits = new_exits & ~exit_reached & ~finished_sequences
-
-                    if new_exits.any():
-                        exit_reached = exit_reached | new_exits
-                        outputs = self.predict_from_latents(current_latents, **aux_inputs)
-                        logits: torch.Tensor = outputs.logits  # type: ignore
-                        if next_token_logits is None:
-                            next_token_logits = logits[:, -1, :].clone()
-                        else:
-                            next_token_logits = torch.where(
-                                new_exits.unsqueeze(1).expand_as(logits[:, -1, :]), logits[:, -1, :], next_token_logits
-                            )
-                        for i in range(batch_size):
-                            if new_exits[i].item():
-                                compute_steps_per_seq[i] = compute_step + 1
-
-                    # If all sequences have exited, break early
-                    if (exit_reached | finished_sequences).all():
-                        break
-            # This else is if the for loop finished without breaking
-            else:
-                outputs = self.predict_from_latents(current_latents, **aux_inputs)
-
-                # For sequences that didn't exit early, use the final logits
-                if next_token_logits is None:
-                    # If no sequence exited early
-                    next_token_logits = outputs.logits[:, -1, :]  # type: ignore
-                    for i in range(batch_size):
-                        compute_steps_per_seq[i] = model_inputs["num_steps"]
-                else:
-                    # Only update logits for sequences that didn't exit early
-                    non_exit_mask = ~exit_reached & ~finished_sequences
-                    next_token_logits = torch.where(
-                        non_exit_mask.unsqueeze(1).expand_as(next_token_logits),
-                        outputs.logits[:, -1, :],  # type: ignore
-                        next_token_logits,
-                    )
-
-                    # Record compute steps for non-exited sequences
-                    for i in range(batch_size):
-                        if non_exit_mask[i].item():
-                            compute_steps_per_seq[i] = model_inputs["num_steps"]
-
-            # Record compute steps for this token generation
-            compute_steps.append((compute_steps_per_seq, exit_values_per_seq))
-
-            # Sample or select next token based on generation config
-            if generation_config.do_sample:
-                next_token = self._sample_next_token(
-                    next_token_logits,
-                    generation_config.temperature,
-                    generation_config.top_k,
-                    generation_config.top_p,
-                    generation_config.min_p,
-                )
-            else:
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)  # type: ignore
-
-            # print(next_token)
-
-            input_ids = torch.cat([input_ids, next_token], dim=-1)  # type: ignore
-
-            if streamer:
-                streamer.put(next_token.cpu())
-
-            # Update model kwargs
-            model_kwargs = self._update_model_kwargs_for_generation(outputs, model_kwargs)
-
-            # Check for finished sequences
-            for i in range(batch_size):
-                if not finished_sequences[i] and stop_tokens is not None and next_token[i, 0] in stop_tokens:
-                    finished_sequences[i] = True
-                    seq_steps[i] = step + 1
-
-            # Break if all sequences are finished
-            if finished_sequences.all():
-                break
-
-        if streamer:
-            streamer.end()
-
-        # print([step[0][0] for step in compute_steps])
-        seq_lens = [seq_steps[i] if seq_steps[i] > 0 else generation_config.max_length - initial_seq_len for i in range(batch_size)]
-        avg_compute_steps = [sum([step[0][i] for step in compute_steps]) / seq_lens[i] for i in range(batch_size)]
-
-        if generation_config.return_dict_in_generate:
-            return RavenGenerateDecoderOnlyOutput(
-                sequences=input_ids,
-                scores=compute_steps,  # type: ignore
-                logits=None,
-                attentions=None,
-                hidden_states=None,
-                past_key_values=model_kwargs.get("past_key_values"),
-                avg_compute_steps=avg_compute_steps,
-            )
-        return input_ids
+        x = self.out(torch.cat([x_seq, x_steps], dim=-1))
+        return F.softmax(x.float(), dim=-1)

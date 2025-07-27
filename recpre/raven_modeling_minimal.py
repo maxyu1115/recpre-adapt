@@ -467,7 +467,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         attn_maps: dict = {},
         return_attn: bool = False,
     ):
-        x = xk = self.initialize_state(input_embeds) if input_states is None else input_states.clone()
+        x = xk = self.initialize_state(input_embeds, deterministic=True) if input_states is None else input_states.clone()
         if num_steps is None:
             num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()  # type: ignore
         elif hasattr(num_steps, "__len__") and len(num_steps) > 1:

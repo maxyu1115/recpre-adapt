@@ -1,3 +1,8 @@
+# Adaptive Compute
+This repo is a detached fork of [Huginn](https://github.com/seal-rg/recurrent-pretraining), with most of our code under `recpre_adapt`. The nature of this fork is hacky and experimental, and is only meant to serve as a reference. Some useful pieces of code that came out of this project has been upstreamed back to [Huginn](https://github.com/seal-rg/recurrent-pretraining).
+
+The report is under `docs/index.md`.
+
 # Pretraining a Depth-Recurrent Model
 
 This repo contains the code we used to train a recurrent-depth model at scale on 4096 AMD GPUs on Frontier. All details on this model can be found in the tech report: "Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach" (https://www.arxiv.org/abs/2502.05171). The final model is `huginn-0125`, which can be found here: https://huggingface.co/tomg-group-umd/huginn-0125. 

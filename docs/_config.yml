@@ -1,0 +1,18 @@
+# docs/_config.yml
+markdown: kramdown
+
+# If you're serving at https://your-username.github.io/your-repo/
+baseurl: "/recpre-adapt"
+
+kramdown:
+  input: GFM
+  math_engine: mathjax    # or katex
+  math_engine_opts:
+    preview: true         # only for MathJax
+
+# (optional) opt-in math on every page
+defaults:
+  - scope:
+      path: ""            # all files in docs/
+    values:
+      math: true

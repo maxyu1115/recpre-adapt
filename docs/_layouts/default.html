@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ page.title }}</title>
+
+  <!-- 1. GitHub Markdown styling -->
+  <link
+    rel="stylesheet"
+    href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.1.0/github-markdown.min.css"
+    integrity="…"
+    crossorigin="anonymous"
+    referrerpolicy="no-referrer" />
+
+  <!-- 2. Fixed-width container CSS -->
+  <style>
+    .markdown-body {
+      box-sizing: border-box;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 45px 20px;
+    }
+    .markdown-body img {
+      max-width: 100%;
+      height: auto;
+    }
+  </style>
+
+  <!-- 3. MathJax include: -->
+  {% include math.html %}
+</head>
+<body>
+
+  <!-- THIS is where your index.md (and any page) will be injected: -->
+  <main class="markdown-body">
+    {{ content }}
+  </main>
+
+</body>
+</html>
